@@ -97,7 +97,7 @@ def evaluate(model, data_loader, device, scaler=None):
             model.train()
             
             loss_dict = model(images, targets)
-        print(loss_dict)
+            model.eval()
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
         losses_reduced = sum(loss for loss in loss_dict_reduced.values())
