@@ -311,7 +311,7 @@ def main(args):
             if val_loss < best_loss:
                 best_loss = val_loss
                 utils.save_on_master(
-                    checkpoint, os.path.join(args.output_dir, "model_best.pth"), is_best=True
+                    checkpoint, os.path.join(args.output_dir, "model_best.pth")
                 )
                 print(f"Best model saved at epoch {epoch}!")
 
