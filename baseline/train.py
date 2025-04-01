@@ -288,7 +288,7 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        # _, val_loss = evaluate(model, data_loader_test, device=device)
+        _, val_loss = evaluate(model, data_loader_test, device=device, scaler=scaler)
         
         train_one_epoch(model, optimizer, data_loader, device, epoch, args.print_freq, scaler)
         lr_scheduler.step()
