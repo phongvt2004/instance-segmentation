@@ -94,6 +94,8 @@ def evaluate(model, data_loader, device, scaler=None):
         model_time = time.time()
         outputs = model(images)
         with torch.cuda.amp.autocast(enabled=scaler is not None):
+            model.train()
+            
             loss_dict = model(images, targets)
         print(loss_dict)
         # reduce losses over all GPUs for logging purposes
