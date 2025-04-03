@@ -1,3 +1,23 @@
+# PyTorch Detection Training.
+
+# To run in a multi-gpu environment, use the distributed launcher::
+
+#     python -m torch.distributed.launch --nproc_per_node=$NGPU --use_env \
+#         train.py ... --world-size $NGPU
+
+# The default hyperparameters are tuned for training on 8 gpus and 2 images per gpu.
+#     --lr 0.02 --batch-size 2 --world-size 8
+# If you use different number of gpus, the learning rate should be changed to 0.02/8*$NGPU.
+
+# On top of that, for training Faster/Mask R-CNN, the default hyperparameters are
+#     --epochs 26 --lr-steps 16 22 --aspect-ratio-group-factor 3
+
+# Also, if you train Keypoint R-CNN, the default hyperparameters are
+#     --epochs 46 --lr-steps 36 43 --aspect-ratio-group-factor 3
+# Because the number of images is smaller in the person keypoint subset of COCO,
+# the number of epochs should be adapted so that we have the same number of iterations.
+# 
+
 import datetime
 import os
 import time
@@ -14,7 +34,10 @@ from engine import evaluate, train_one_epoch
 from group_by_aspect_ratio import create_aspect_ratio_groups, GroupedBatchSampler
 from torchvision.transforms import InterpolationMode
 from transforms import SimpleCopyPaste
-
+from torchvision.models.detection import MaskRCNN
+from torchvision.models.detection.backbone_utils import BackboneWithFPN
+import torchvision.models as models
+from torchvision.models import ResNeXt101_32X8D_Weights
 
 def copypaste_collate_fn(batch):
     copypaste = SimpleCopyPaste(blending=True, resize_interpolation=InterpolationMode.BILINEAR)
@@ -50,6 +73,53 @@ def get_transform(is_train, args):
     else:
         return presets.DetectionPresetEval(backend=args.backend, use_v2=args.use_v2)
 
+def create_maskrcnn_resnext101(num_classes, pretrained_backbone=True):
+    """
+    Creates a Mask R-CNN model with a ResNeXt-101 (32x8d) backbone.
+
+    Args:
+        num_classes (int): The number of **foreground** classes
+                           (excluding the background).
+        pretrained_backbone (bool): If True, load backbone weights
+                                    pre-trained on ImageNet.
+
+    Returns:
+        torchvision.models.detection.MaskRCNN: The Mask R-CNN model.
+    """
+    # --- 1. Load the ResNeXt-101 Backbone (feature extractor part) ---
+    if pretrained_backbone:
+        weights = ResNeXt101_32X8D_Weights.DEFAULT # Or .IMAGENET1K_V2
+        backbone_model = models.resnext101_32x8d(weights=weights)
+    else:
+        backbone_model = models.resnext101_32x8d(weights=None, pretrained=False) # Ensure no weights if specified
+
+    # --- 2. Extract Feature Layers for FPN ---
+    # We need the output channels of the layers that will feed into the FPN
+    # For ResNeXt-101 (and ResNet-101), these are typically layers 1, 2, 3, and 4
+    # The channel counts for ResNeXt-101 (32x8d) are:
+    # layer1: 256 channels
+    # layer2: 512 channels
+    # layer3: 1024 channels
+    # layer4: 2048 channels
+    return_layers = {'layer1': '0', 'layer2': '1', 'layer3': '2', 'layer4': '3'}
+    in_channels_list = [256, 512, 1024, 2048]
+    out_channels = 256  # Standard output channels for FPN
+
+    # --- 3. Create the Backbone with FPN ---
+    # Remove the average pooling and fully connected layer from the original classifier
+    # BackboneWithFPN handles selecting the correct layers based on return_layers
+    backbone_with_fpn = BackboneWithFPN(backbone_model, return_layers, in_channels_list, out_channels)
+
+    # --- 4. Create the Mask R-CNN Model ---
+    # The model requires num_classes + 1 (for the background class)
+    model = MaskRCNN(backbone_with_fpn, num_classes=num_classes + 1)
+
+    print(f"Created Mask R-CNN model with ResNeXt-101 (32x8d) backbone.")
+    if pretrained_backbone:
+        print("Backbone weights loaded from ImageNet pretraining.")
+    print(f"Model configured for {num_classes} foreground classes + 1 background class.")
+
+    return model
 
 def get_args_parser(add_help=True):
     import argparse

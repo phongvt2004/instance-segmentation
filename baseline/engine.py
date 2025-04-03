@@ -92,6 +92,7 @@ def evaluate(model, data_loader, device, scaler=None):
             torch.cuda.synchronize()
         model_time = time.time()
         outputs = model(images)
+        
         with torch.cuda.amp.autocast(enabled=scaler is not None):
             model.train()
             loss_dict = model(images, targets)
