@@ -202,7 +202,7 @@ def get_coco(root, image_set, transforms, mode="instances", use_v2=False, with_m
     PATHS = {
         "train": ("train2017", os.path.join("annotations", anno_file_template.format(mode, "train"))),
         "val": ("val2017", os.path.join("annotations", anno_file_template.format(mode, "val"))),
-        "train": ("test2017", os.path.join("annotations", anno_file_template.format(mode, "test")))
+        "test": ("test2017", os.path.join("annotations", anno_file_template.format(mode, "test")))
     }
 
     img_folder, ann_file = PATHS[image_set]
