@@ -28,5 +28,5 @@ You must modify the following flags:
 ./eval.sh
 ```
 
-### Reference
+### References
 [Torchvision references](https://github.com/pytorch/vision/tree/main/references)
