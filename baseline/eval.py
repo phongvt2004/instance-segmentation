@@ -23,8 +23,6 @@ def copypaste_collate_fn(batch):
 
 def get_dataset(is_train, args):
     image_set = "train" if is_train else "val"
-    if args.test_only:
-        image_set = "test"
     num_classes, mode = {"coco": (91, "instances"), "coco_kp": (2, "person_keypoints")}[args.dataset]
     with_masks = "mask" in args.model
     ds = get_coco(
@@ -143,19 +141,11 @@ def get_args_parser(add_help=True):
     # distributed training parameters
     parser.add_argument("--world-size", default=1, type=int, help="number of distributed processes")
     parser.add_argument("--dist-url", default="env://", type=str, help="url used to set up distributed training")
-    parser.add_argument("--weights", default=None, type=str, help="the weights enum name to load")
-    parser.add_argument("--weights-backbone", default=None, type=str, help="the backbone weights enum name to load")
 
     # Mixed precision training parameters
     parser.add_argument("--amp", action="store_true", help="Use torch.cuda.amp for mixed precision training")
 
     # Use CopyPaste augmentation training parameter
-    parser.add_argument(
-        "--use-copypaste",
-        action="store_true",
-        help="Use CopyPaste data augmentation. Works only with data-augmentation='lsj'.",
-    )
-
     parser.add_argument("--backend", default="PIL", type=str.lower, help="PIL or tensor - case insensitive")
     parser.add_argument("--use-v2", action="store_true", help="Use V2 transforms")
 
@@ -172,9 +162,6 @@ def main(args):
     if args.dataset == "coco_kp" and args.use_v2:
         raise ValueError("KeyPoint detection doesn't support V2 transforms yet")
 
-    if args.output_dir:
-        utils.mkdir(args.output_dir)
-
     utils.init_distributed_mode(args)
     print(args)
 
@@ -185,34 +172,13 @@ def main(args):
 
     # Data loading code
     print("Loading data")
-
-    dataset, num_classes = get_dataset(is_train=True, args=args)
-    dataset_test, _ = get_dataset(is_train=False, args=args)
+    dataset_test, num_classes = get_dataset(is_train=False, args=args)
 
     print("Creating data loaders")
     if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
     else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
         test_sampler = torch.utils.data.SequentialSampler(dataset_test)
-
-    if args.aspect_ratio_group_factor >= 0:
-        group_ids = create_aspect_ratio_groups(dataset, k=args.aspect_ratio_group_factor)
-        train_batch_sampler = GroupedBatchSampler(train_sampler, group_ids, args.batch_size)
-    else:
-        train_batch_sampler = torch.utils.data.BatchSampler(train_sampler, args.batch_size, drop_last=True)
-
-    train_collate_fn = utils.collate_fn
-    if args.use_copypaste:
-        if args.data_augmentation != "lsj":
-            raise RuntimeError("SimpleCopyPaste algorithm currently only supports the 'lsj' data augmentation policies")
-
-        train_collate_fn = copypaste_collate_fn
-
-    data_loader = torch.utils.data.DataLoader(
-        dataset, batch_sampler=train_batch_sampler, num_workers=args.workers, collate_fn=train_collate_fn
-    )
 
     data_loader_test = torch.utils.data.DataLoader(
         dataset_test, batch_size=1, sampler=test_sampler, num_workers=args.workers, collate_fn=utils.collate_fn
@@ -226,7 +192,7 @@ def main(args):
         if args.rpn_score_thresh is not None:
             kwargs["rpn_score_thresh"] = args.rpn_score_thresh
     model = torchvision.models.get_model(
-        args.model, weights=args.weights, weights_backbone=args.weights_backbone, num_classes=num_classes, **kwargs
+        args.model, num_classes=num_classes
     )
     model.to(device)
     if args.distributed and args.sync_bn:
@@ -236,47 +202,11 @@ def main(args):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
-
-    if args.norm_weight_decay is None:
-        parameters = [p for p in model.parameters() if p.requires_grad]
-    else:
-        param_groups = torchvision.ops._utils.split_normalization_params(model)
-        wd_groups = [args.norm_weight_decay, args.weight_decay]
-        parameters = [{"params": p, "weight_decay": w} for p, w in zip(param_groups, wd_groups) if p]
-
-    opt_name = args.opt.lower()
-    if opt_name.startswith("sgd"):
-        optimizer = torch.optim.SGD(
-            parameters,
-            lr=args.lr,
-            momentum=args.momentum,
-            weight_decay=args.weight_decay,
-            nesterov="nesterov" in opt_name,
-        )
-    elif opt_name == "adamw":
-        optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay)
-    else:
-        raise RuntimeError(f"Invalid optimizer {args.opt}. Only SGD and AdamW are supported.")
-
     scaler = torch.cuda.amp.GradScaler() if args.amp else None
-
-    args.lr_scheduler = args.lr_scheduler.lower()
-    if args.lr_scheduler == "multisteplr":
-        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_steps, gamma=args.lr_gamma)
-    elif args.lr_scheduler == "cosineannealinglr":
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    else:
-        raise RuntimeError(
-            f"Invalid lr scheduler '{args.lr_scheduler}'. Only MultiStepLR and CosineAnnealingLR are supported."
-        )
-
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
-        model_without_ddp.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-        args.start_epoch = checkpoint["epoch"] + 1
-        if args.amp:
+    
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    model_without_ddp.load_state_dict(checkpoint["model"])
+    if args.amp:
             scaler.load_state_dict(checkpoint["scaler"])
 
     if args.test_only:
@@ -284,42 +214,13 @@ def main(args):
         evaluate(model, data_loader_test, device=device)
         return
 
-    print("Start training")
+    print("Start testing")
     start_time = time.time()
-    best_loss = float("inf")
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-        
-        train_one_epoch(model, optimizer, data_loader, device, epoch, args.print_freq, scaler)
-        lr_scheduler.step()
-        if args.output_dir:
-            checkpoint = {
-                "model": model_without_ddp.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "lr_scheduler": lr_scheduler.state_dict(),
-                "args": args,
-                "epoch": epoch,
-            }
-            if args.amp:
-                checkpoint["scaler"] = scaler.state_dict()
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
-
-        # evaluate after every epoch
-        _, val_loss = evaluate(model, data_loader_test, device=device, scaler=scaler)
-        
-        if args.output_dir:
-            if val_loss < best_loss:
-                best_loss = val_loss
-                utils.save_on_master(
-                    checkpoint, os.path.join(args.output_dir, "model_best.pth")
-                )
-                print(f"Best model saved at epoch {epoch}!")
+    evaluate(model, data_loader_test, device=device, scaler=scaler, loss = False)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print(f"Training time {total_time_str}")
+    print(f"Testing time {total_time_str}")
 
 
 if __name__ == "__main__":
