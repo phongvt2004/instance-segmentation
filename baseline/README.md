@@ -19,8 +19,10 @@ You must modify the following flags:
 `--nproc_per_node=<number_of_gpus_available>`
 
 ### Resources
-[Our COCO subset](https://www.kaggle.com/datasets/phongvt2k4/coco-2017-subset)
-[Checkpoints](https://www.kaggle.com/models/phongvt2k4/checkpoint-mask-rcnn)
+| Link            |
+| ------------------ |
+| [Our COCO subset](https://www.kaggle.com/datasets/phongvt2k4/coco-2017-subset) |
+| [Checkpoints](https://www.kaggle.com/models/phongvt2k4/checkpoint-mask-rcnn) |
 
 ### Training
 ```
