@@ -297,7 +297,7 @@ def main(args):
         if args.rpn_score_thresh is not None:
             kwargs["rpn_score_thresh"] = args.rpn_score_thresh
     if args.model == "my_maskrcnn":
-        model = my_maskrcnn_resnet50_fpn(
+        model = my_maskrcnn_swin_t_fpn(
             weights=args.weights, weights_backbone=args.weights_backbone, num_classes=num_classes, **kwargs
         )
     else:
