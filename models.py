@@ -418,32 +418,41 @@ class CustomSwinFPN(nn.Module):
 
     def forward(self, x):
         # 1. Get features from the body (feature extractor)
-        features = self.body(x) # Expected output: {'feat0': tensor, 'feat1': tensor, ...}
+        # Output format is likely B, H, W, C
+        features = self.body(x)
 
-        # 2. Rename keys for FPN input
+        # 2. Rename keys AND Permute dimensions for FPN input
         fpn_input = OrderedDict()
+        print("--- Features before Permutation ---") # Add this temporary print
+        for body_key in self.return_layer_keys:
+             if body_key in features:
+                 print(f"  Key: {body_key}, Shape: {features[body_key].shape}")
+             else:
+                 print(f"  WARNING: Key {body_key} not found!")
+        print("-----------------------------------")
+
         for body_key, fpn_key in self.fpn_map.items():
             if body_key in features:
-                fpn_input[fpn_key] = features[body_key]
+                # Get the tensor in B, H, W, C format
+                tensor_bhwc = features[body_key]
+                # Permute to B, C, H, W format expected by Conv2d
+                # (0, 3, 1, 2) means: keep dim 0 as is, move dim 3 to pos 1, dim 1 to pos 2, dim 2 to pos 3
+                tensor_bchw = tensor_bhwc.permute(0, 3, 1, 2)
+                fpn_input[fpn_key] = tensor_bchw
             else:
-                # This indicates a problem with create_feature_extractor or key definition
                 raise KeyError(f"Expected key '{body_key}' not found in feature extractor output. Found keys: {features.keys()}")
 
-        # --- !! DEBUGGING PRINT !! ---
-        print("--- Features entering FPN ---")
+        # --- Optional: Print shapes AFTER permutation to confirm ---
+        print("--- Features entering FPN (After Permutation) ---")
         for key, tensor in fpn_input.items():
             print(f"  Key: {key}, Shape: {tensor.shape}, Dtype: {tensor.dtype}")
-            # Check if the tensor looks like B, C, H, W or something else
-            if tensor.ndim != 4:
-                print(f"  WARNING: Tensor for key '{key}' does not have 4 dimensions!")
         print("-----------------------------")
         # --- End Debugging Print ---
 
 
-        # 3. Pass renamed features to FPN
-        fpn_output = self.fpn(fpn_input) # FPN expects {'0': tensor, '1': tensor, ...}
+        # 3. Pass permuted features (B, C, H, W) to FPN
+        fpn_output = self.fpn(fpn_input) # FPN expects B, C, H, W
         return fpn_output
-
 def my_maskrcnn_swin_t_fpn(
         *,
         weights: Optional[str] = None,
