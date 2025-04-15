@@ -37,7 +37,7 @@ from transforms import SimpleCopyPaste
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.backbone_utils import BackboneWithFPN
 import torchvision.models as models
-from .models import *
+from models import *
 from torchvision.models import ResNeXt101_32X8D_Weights
 
 def copypaste_collate_fn(batch):
