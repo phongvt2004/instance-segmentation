@@ -296,8 +296,12 @@ def main(args):
     if "rcnn" in args.model:
         if args.rpn_score_thresh is not None:
             kwargs["rpn_score_thresh"] = args.rpn_score_thresh
-    if args.model == "my_maskrcnn":
+    if args.model == "my_maskrcnn_swin_t_fpn":
         model = my_maskrcnn_swin_t_fpn(
+            weights=args.weights, weights_backbone=args.weights_backbone, num_classes=num_classes, **kwargs
+        )
+    elif args.model == "my_maskrcnn_swin_resnet_fpn":
+        model = my_maskrcnn_swin_resnet_fpn(
             weights=args.weights, weights_backbone=args.weights_backbone, num_classes=num_classes, **kwargs
         )
     else:
