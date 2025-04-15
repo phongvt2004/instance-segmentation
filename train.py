@@ -74,54 +74,6 @@ def get_transform(is_train, args):
     else:
         return presets.DetectionPresetEval(backend=args.backend, use_v2=args.use_v2)
 
-def create_maskrcnn_resnext101(num_classes, pretrained_backbone=True):
-    """
-    Creates a Mask R-CNN model with a ResNeXt-101 (32x8d) backbone.
-
-    Args:
-        num_classes (int): The number of **foreground** classes
-                           (excluding the background).
-        pretrained_backbone (bool): If True, load backbone weights
-                                    pre-trained on ImageNet.
-
-    Returns:
-        torchvision.models.detection.MaskRCNN: The Mask R-CNN model.
-    """
-    # --- 1. Load the ResNeXt-101 Backbone (feature extractor part) ---
-    if pretrained_backbone:
-        weights = ResNeXt101_32X8D_Weights.DEFAULT # Or .IMAGENET1K_V2
-        backbone_model = models.resnext101_32x8d(weights=weights)
-    else:
-        backbone_model = models.resnext101_32x8d(weights=None, pretrained=False) # Ensure no weights if specified
-
-    # --- 2. Extract Feature Layers for FPN ---
-    # We need the output channels of the layers that will feed into the FPN
-    # For ResNeXt-101 (and ResNet-101), these are typically layers 1, 2, 3, and 4
-    # The channel counts for ResNeXt-101 (32x8d) are:
-    # layer1: 256 channels
-    # layer2: 512 channels
-    # layer3: 1024 channels
-    # layer4: 2048 channels
-    return_layers = {'layer1': '0', 'layer2': '1', 'layer3': '2', 'layer4': '3'}
-    in_channels_list = [256, 512, 1024, 2048]
-    out_channels = 256  # Standard output channels for FPN
-
-    # --- 3. Create the Backbone with FPN ---
-    # Remove the average pooling and fully connected layer from the original classifier
-    # BackboneWithFPN handles selecting the correct layers based on return_layers
-    backbone_with_fpn = BackboneWithFPN(backbone_model, return_layers, in_channels_list, out_channels)
-
-    # --- 4. Create the Mask R-CNN Model ---
-    # The model requires num_classes + 1 (for the background class)
-    model = MaskRCNN(backbone_with_fpn, num_classes=num_classes + 1)
-
-    print(f"Created Mask R-CNN model with ResNeXt-101 (32x8d) backbone.")
-    if pretrained_backbone:
-        print("Backbone weights loaded from ImageNet pretraining.")
-    print(f"Model configured for {num_classes} foreground classes + 1 background class.")
-
-    return model
-
 def get_args_parser(add_help=True):
     import argparse
 
@@ -349,12 +301,14 @@ def main(args):
         raise RuntimeError(
             f"Invalid lr scheduler '{args.lr_scheduler}'. Only MultiStepLR and CosineAnnealingLR are supported."
         )
+    best_loss = float("inf")
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model_without_ddp.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        best_loss = float(checkpoint["best_loss"])
         args.start_epoch = checkpoint["epoch"] + 1
         if args.amp:
             scaler.load_state_dict(checkpoint["scaler"])
@@ -366,13 +320,16 @@ def main(args):
 
     print("Start training")
     start_time = time.time()
-    best_loss = float("inf")
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         
         train_one_epoch(model, optimizer, data_loader, device, epoch, args.print_freq, scaler)
         lr_scheduler.step()
+
+        # evaluate after every epoch
+        _, val_loss = evaluate(model, data_loader_test, device=device, scaler=scaler)
+        
         if args.output_dir:
             checkpoint = {
                 "model": model_without_ddp.state_dict(),
@@ -380,22 +337,20 @@ def main(args):
                 "lr_scheduler": lr_scheduler.state_dict(),
                 "args": args,
                 "epoch": epoch,
+                "best_loss": best_loss,
             }
             if args.amp:
                 checkpoint["scaler"] = scaler.state_dict()
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
-
-        # evaluate after every epoch
-        _, val_loss = evaluate(model, data_loader_test, device=device, scaler=scaler)
-        
-        if args.output_dir:
             if val_loss < best_loss:
                 best_loss = val_loss
+                checkpoint["best_loss"] = best_loss
                 utils.save_on_master(
                     checkpoint, os.path.join(args.output_dir, "model_best.pth")
                 )
                 print(f"Best model saved at epoch {epoch}!")
+
+            utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
+            utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
