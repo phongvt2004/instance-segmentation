@@ -525,6 +525,6 @@ if __name__ == "__main__":
     model = my_maskrcnn_swin_t_fpn().to(device)
     model.eval()
     print(model)
-    x = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
+    x = [torch.rand(3, 300, 400).to(device), torch.rand(3, 500, 400).to(device)]
     predictions = model(x)
     print(predictions)
