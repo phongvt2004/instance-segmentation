@@ -429,6 +429,17 @@ class CustomSwinFPN(nn.Module):
                 # This indicates a problem with create_feature_extractor or key definition
                 raise KeyError(f"Expected key '{body_key}' not found in feature extractor output. Found keys: {features.keys()}")
 
+        # --- !! DEBUGGING PRINT !! ---
+        print("--- Features entering FPN ---")
+        for key, tensor in fpn_input.items():
+            print(f"  Key: {key}, Shape: {tensor.shape}, Dtype: {tensor.dtype}")
+            # Check if the tensor looks like B, C, H, W or something else
+            if tensor.ndim != 4:
+                print(f"  WARNING: Tensor for key '{key}' does not have 4 dimensions!")
+        print("-----------------------------")
+        # --- End Debugging Print ---
+
+
         # 3. Pass renamed features to FPN
         fpn_output = self.fpn(fpn_input) # FPN expects {'0': tensor, '1': tensor, ...}
         return fpn_output
