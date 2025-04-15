@@ -423,13 +423,6 @@ class CustomSwinFPN(nn.Module):
 
         # 2. Rename keys AND Permute dimensions for FPN input
         fpn_input = OrderedDict()
-        print("--- Features before Permutation ---") # Add this temporary print
-        for body_key in self.return_layer_keys:
-             if body_key in features:
-                 print(f"  Key: {body_key}, Shape: {features[body_key].shape}")
-             else:
-                 print(f"  WARNING: Key {body_key} not found!")
-        print("-----------------------------------")
 
         for body_key, fpn_key in self.fpn_map.items():
             if body_key in features:
@@ -441,14 +434,6 @@ class CustomSwinFPN(nn.Module):
                 fpn_input[fpn_key] = tensor_bchw
             else:
                 raise KeyError(f"Expected key '{body_key}' not found in feature extractor output. Found keys: {features.keys()}")
-
-        # --- Optional: Print shapes AFTER permutation to confirm ---
-        print("--- Features entering FPN (After Permutation) ---")
-        for key, tensor in fpn_input.items():
-            print(f"  Key: {key}, Shape: {tensor.shape}, Dtype: {tensor.dtype}")
-        print("-----------------------------")
-        # --- End Debugging Print ---
-
 
         # 3. Pass permuted features (B, C, H, W) to FPN
         fpn_output = self.fpn(fpn_input) # FPN expects B, C, H, W
@@ -480,8 +465,6 @@ def my_maskrcnn_swin_t_fpn(
     }
     # Store the output keys in order, corresponding to increasing stride
     extractor_output_keys = ['feat0', 'feat1', 'feat2', 'feat3']
-    print(f"Nodes for feature extractor: {return_nodes_for_extractor}")
-    print(f"Extractor output keys (ordered): {extractor_output_keys}")
 
     # --- 3. Create the Feature Extractor Body ---
     print("Creating feature extractor body...")
