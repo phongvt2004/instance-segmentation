@@ -3,3 +3,5 @@ torchvision
 cython
 pycocotools
 matplotlib
+transformers
+dotenv

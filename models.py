@@ -1,13 +1,35 @@
-
-from torchvision.models.detection import MaskRCNN, MaskRCNNHeads, MaskRCNNPredictor, MaskRCNN_ResNet50_FPN_Weights, ResNet50_Weights
+import numpy as np
+import torchvision
+from torchvision.models import ResNet50_Weights, resnet50
+from huggingface_hub import login
+import os
+from torchvision.models.detection import MaskRCNN, MaskRCNN_ResNet50_FPN_Weights
+from torchvision.models.detection.mask_rcnn import MaskRCNNHeads, MaskRCNNPredictor
+from torchvision.models.feature_extraction import create_feature_extractor, get_graph_node_names
 from torchvision.ops import MultiScaleRoIAlign, misc as misc_nn_ops
 import torch
 import warnings
 from collections import OrderedDict
-from typing import List, Dict, Tuple, Optional
-from torch import Tensor
-from torch.models.resnet import resnet50, ResNet50_Weights
-from torchvision.models.detection.backbone_utils import _resnet_fpn_extractor, _validate_trainable_layers 
+from typing import List, Dict, Tuple, Optional, Any
+from torch import Tensor, nn
+from torchvision.models.detection.backbone_utils import _resnet_fpn_extractor, _validate_trainable_layers, \
+    BackboneWithFPN
+from transformers import ViTModel, ViTConfig, AutoProcessor
+from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork, LastLevelMaxPool
+from dotenv import load_dotenv
+
+load_dotenv()
+class MyBackbone(nn.Module):
+    def init(self, cnn_backbone):
+        super(MyBackbone, self).init()
+        self.cnn_backbone = cnn_backbone
+
+    def forward(self, x):
+        return self.backbone(x)
+
+    @property
+    def out_channels(self):
+        return self.backbone.out_channels
 class MyMaskRCNN(MaskRCNN):
     """
     Implements Mask R-CNN.
@@ -265,6 +287,7 @@ class MyMaskRCNN(MaskRCNN):
                 like `scores`, `labels` and `mask` (for Mask R-CNN models).
 
         """
+
         if self.training:
             if targets is None:
                 torch._assert(False, "targets should not be none when in training mode")
@@ -287,7 +310,6 @@ class MyMaskRCNN(MaskRCNN):
                 f"expecting the last two dimensions of the Tensor to be H and W instead got {img.shape[-2:]}",
             )
             original_image_sizes.append((val[0], val[1]))
-
         images, targets = self.transform(images, targets)
 
         # Check for degenerate boxes
@@ -307,6 +329,8 @@ class MyMaskRCNN(MaskRCNN):
                     )
 
         features = self.backbone(images.tensors)
+        for k, v in features.items():
+            print(k, v.shape)
         if isinstance(features, torch.Tensor):
             features = OrderedDict([("0", features)])
         proposals, proposal_losses = self.rpn(images, features, targets)
@@ -324,87 +348,16 @@ class MyMaskRCNN(MaskRCNN):
             return losses, detections
         else:
             return self.eager_outputs(losses, detections)
-
-
-def maskrcnn_resnet50_fpn(
+def my_maskrcnn_resnet50_fpn(
     *,
-    weights: Optional[MaskRCNN_ResNet50_FPN_Weights] = None,
+    weights: Optional[str] = None,
     progress: bool = True,
     num_classes: Optional[int] = None,
     weights_backbone: Optional[ResNet50_Weights] = ResNet50_Weights.IMAGENET1K_V1,
     trainable_backbone_layers: Optional[int] = None,
     **kwargs: Any,
-) -> MaskRCNN:
-    """Mask R-CNN model with a ResNet-50-FPN backbone from the `Mask R-CNN
-    <https://arxiv.org/abs/1703.06870>`_ paper.
+    ) -> MyMaskRCNN:
 
-    .. betastatus:: detection module
-
-    The input to the model is expected to be a list of tensors, each of shape ``[C, H, W]``, one for each
-    image, and should be in ``0-1`` range. Different images can have different sizes.
-
-    The behavior of the model changes depending on if it is in training or evaluation mode.
-
-    During training, the model expects both the input tensors and targets (list of dictionary),
-    containing:
-
-        - boxes (``FloatTensor[N, 4]``): the ground-truth boxes in ``[x1, y1, x2, y2]`` format, with
-          ``0 <= x1 < x2 <= W`` and ``0 <= y1 < y2 <= H``.
-        - labels (``Int64Tensor[N]``): the class label for each ground-truth box
-        - masks (``UInt8Tensor[N, H, W]``): the segmentation binary masks for each instance
-
-    The model returns a ``Dict[Tensor]`` during training, containing the classification and regression
-    losses for both the RPN and the R-CNN, and the mask loss.
-
-    During inference, the model requires only the input tensors, and returns the post-processed
-    predictions as a ``List[Dict[Tensor]]``, one for each input image. The fields of the ``Dict`` are as
-    follows, where ``N`` is the number of detected instances:
-
-        - boxes (``FloatTensor[N, 4]``): the predicted boxes in ``[x1, y1, x2, y2]`` format, with
-          ``0 <= x1 < x2 <= W`` and ``0 <= y1 < y2 <= H``.
-        - labels (``Int64Tensor[N]``): the predicted labels for each instance
-        - scores (``Tensor[N]``): the scores or each instance
-        - masks (``UInt8Tensor[N, 1, H, W]``): the predicted masks for each instance, in ``0-1`` range. In order to
-          obtain the final segmentation masks, the soft masks can be thresholded, generally
-          with a value of 0.5 (``mask >= 0.5``)
-
-    For more details on the output and on how to plot the masks, you may refer to :ref:`instance_seg_output`.
-
-    Mask R-CNN is exportable to ONNX for a fixed batch size with inputs images of fixed size.
-
-    Example::
-
-        >>> model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
-        >>> model.eval()
-        >>> x = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
-        >>> predictions = model(x)
-        >>>
-        >>> # optionally, if you want to export the model to ONNX:
-        >>> torch.onnx.export(model, x, "mask_rcnn.onnx", opset_version = 11)
-
-    Args:
-        weights (:class:`~torchvision.models.detection.MaskRCNN_ResNet50_FPN_Weights`, optional): The
-            pretrained weights to use. See
-            :class:`~torchvision.models.detection.MaskRCNN_ResNet50_FPN_Weights` below for
-            more details, and possible values. By default, no pre-trained
-            weights are used.
-        progress (bool, optional): If True, displays a progress bar of the
-            download to stderr. Default is True.
-        num_classes (int, optional): number of output classes of the model (including the background)
-        weights_backbone (:class:`~torchvision.models.ResNet50_Weights`, optional): The
-            pretrained weights for the backbone.
-        trainable_backbone_layers (int, optional): number of trainable (not frozen) layers starting from
-            final block. Valid values are between 0 and 5, with 5 meaning all backbone layers are
-            trainable. If ``None`` is passed (the default) this value is set to 3.
-        **kwargs: parameters passed to the ``torchvision.models.detection.mask_rcnn.MaskRCNN``
-            base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/detection/mask_rcnn.py>`_
-            for more details about this class.
-
-    .. autoclass:: torchvision.models.detection.MaskRCNN_ResNet50_FPN_Weights
-        :members:
-    """
-    weights = MaskRCNN_ResNet50_FPN_Weights.verify(weights)
     weights_backbone = ResNet50_Weights.verify(weights_backbone)
 
     if weights is not None:
@@ -419,11 +372,158 @@ def maskrcnn_resnet50_fpn(
 
     backbone = resnet50(weights=weights_backbone, progress=progress, norm_layer=norm_layer)
     backbone = _resnet_fpn_extractor(backbone, trainable_backbone_layers)
-    model = MaskRCNN(backbone, num_classes=num_classes, **kwargs)
+    model = MyMaskRCNN(backbone, num_classes=num_classes, **kwargs)
 
     if weights is not None:
-        model.load_state_dict(weights.get_state_dict(progress=progress, check_hash=True))
-        if weights == MaskRCNN_ResNet50_FPN_Weights.COCO_V1:
-            overwrite_eps(model, 0.0)
+        model.load_state_dict(weights)
 
     return model
+
+class CustomSwinFPN(nn.Module):
+    """
+    A custom module that combines a feature extractor (like one from
+    create_feature_extractor) with a Feature Pyramid Network (FPN).
+
+    Handles the potential mismatch in dictionary keys between the
+    feature extractor output and the FPN input.
+    """
+    def __init__(self, body, return_layer_keys, fpn_in_channels_list, fpn_out_channels, extra_blocks=None):
+        """
+        Args:
+            body (nn.Module): The feature extractor module (e.g., from create_feature_extractor).
+                              Expected to return a dict[str, Tensor].
+            return_layer_keys (List[str]): The keys that 'body' returns in its output dict,
+                                           in the order corresponding to strides (e.g., ['feat0', 'feat1', 'feat2', 'feat3']).
+            fpn_in_channels_list (List[int]): List of input channels for each FPN level, matching the channels
+                                              of the tensors returned by 'body' for the keys in 'return_layer_keys'.
+            fpn_out_channels (int): The number of output channels for each FPN feature map.
+            extra_blocks (nn.Module, optional): An optional extra block to apply after the last FPN level
+                                                (e.g., LastLevelMaxPool for P6). Defaults to None.
+        """
+        super().__init__()
+        self.body = body # The model created by create_feature_extractor
+        self.return_layer_keys = return_layer_keys # e.g., ['feat0', 'feat1', 'feat2', 'feat3']
+        # Map the body output keys to the keys FPN expects ('0', '1', '2', '3')
+        self.fpn_map = {key: str(i) for i, key in enumerate(return_layer_keys)}
+
+        print(f"CustomSwinFPN: Mapping body keys {list(self.fpn_map.keys())} to FPN keys {list(self.fpn_map.values())}")
+
+        self.fpn = FeaturePyramidNetwork(
+            in_channels_list=fpn_in_channels_list,
+            out_channels=fpn_out_channels,
+            extra_blocks=extra_blocks,
+        )
+        # IMPORTANT: MaskRCNN and FasterRCNN expect the backbone to have this attribute
+        self.out_channels = fpn_out_channels
+
+    def forward(self, x):
+        # 1. Get features from the body (feature extractor)
+        features = self.body(x) # Expected output: {'feat0': tensor, 'feat1': tensor, ...}
+
+        # 2. Rename keys for FPN input
+        fpn_input = OrderedDict()
+        for body_key, fpn_key in self.fpn_map.items():
+            if body_key in features:
+                fpn_input[fpn_key] = features[body_key]
+            else:
+                # This indicates a problem with create_feature_extractor or key definition
+                raise KeyError(f"Expected key '{body_key}' not found in feature extractor output. Found keys: {features.keys()}")
+
+        # 3. Pass renamed features to FPN
+        fpn_output = self.fpn(fpn_input) # FPN expects {'0': tensor, '1': tensor, ...}
+        return fpn_output
+
+def my_maskrcnn_swin_t_fpn(
+        *,
+        weights: Optional[str] = None,
+        progress: bool = True,
+        num_classes: Optional[int] = None,
+        weights_backbone: Optional[ResNet50_Weights] = ResNet50_Weights.IMAGENET1K_V1,
+        trainable_backbone_layers: Optional[int] = None,
+        **kwargs: Any,
+) -> MyMaskRCNN:
+    NUM_CLASSES = 91
+    PRETRAINED_SWIN = True
+    FPN_OUT_CHANNELS = 256
+
+    # --- 1. Load Swin Model ---
+    weights = torchvision.models.Swin_T_Weights.DEFAULT if PRETRAINED_SWIN else None
+    swin_model = torchvision.models.swin_t(weights=weights).cpu()  # Load on CPU
+
+    # --- 2. Define Nodes and Output Keys for Extractor ---
+    # Use the correct internal node names as keys, and assign simple output keys as values
+    return_nodes_for_extractor = {
+        'features.1.1.add_1': 'feat0',  # Stage 1 out
+        'features.3.1.add_1': 'feat1',  # Stage 2 out
+        'features.5.5.add_1': 'feat2',  # Stage 3 out
+        'features.7.1.add_1': 'feat3',  # Stage 4 out
+    }
+    # Store the output keys in order, corresponding to increasing stride
+    extractor_output_keys = ['feat0', 'feat1', 'feat2', 'feat3']
+    print(f"Nodes for feature extractor: {return_nodes_for_extractor}")
+    print(f"Extractor output keys (ordered): {extractor_output_keys}")
+
+    # --- 3. Create the Feature Extractor Body ---
+    print("Creating feature extractor body...")
+    try:
+        body = create_feature_extractor(swin_model, return_nodes=return_nodes_for_extractor)
+        print("Feature extractor body created successfully.")
+    except Exception as e:
+        import traceback
+        print(f"\nError creating feature extractor body: {e}")
+        print(traceback.format_exc())
+        exit()
+
+    # --- 4. Define Input Channels for FPN ---
+    # Corresponds channel count for 'feat0', 'feat1', 'feat2', 'feat3' outputs
+    fpn_in_channels_list = [96, 192, 384, 768]  # For Swin-T
+
+    # --- 5. Create the Custom Backbone + FPN ---
+    print("Creating CustomSwinFPN...")
+    try:
+        # Create an instance of our custom wrapper
+        custom_backbone = CustomSwinFPN(
+            body=body,
+            return_layer_keys=extractor_output_keys,  # Pass the keys body will return
+            fpn_in_channels_list=fpn_in_channels_list,
+            fpn_out_channels=FPN_OUT_CHANNELS,
+            # Optional: Add extra_blocks for P6 if needed for your MaskRCNN config
+            # extra_blocks=LastLevelMaxPool()
+        )
+        print("CustomSwinFPN created successfully.")
+    except Exception as e:
+        import traceback
+        print(f"\nError creating CustomSwinFPN: {e}")
+        print(traceback.format_exc())
+        exit()
+
+    # --- 6. Create the Mask R-CNN Model ---
+    print("Creating MaskRCNN model...")
+    try:
+        # Pass our custom backbone to MaskRCNN
+        model = MaskRCNN(
+            custom_backbone,  # Use our custom wrapper
+            num_classes=NUM_CLASSES,
+        )
+        print("MaskRCNN model created successfully.")
+    except Exception as e:
+        import traceback
+        print(f"\nError creating MaskRCNN: {e}")
+        print(traceback.format_exc())
+        print("Ensure custom_backbone has the '.out_channels' attribute set correctly.")
+        exit()
+
+    # if weights is not None:
+    #     model.load_state_dict(weights)
+
+    return model
+
+if __name__ == "__main__":
+    # Example usage
+    login(token=os.getenv("HUGGINGFACE_TOKEN"))
+    model = my_maskrcnn_swin_t_fpn()
+    model.eval()
+    print(model)
+    x = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
+    predictions = model(x)
+    print(predictions)

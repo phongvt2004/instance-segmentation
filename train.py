@@ -37,6 +37,7 @@ from transforms import SimpleCopyPaste
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.backbone_utils import BackboneWithFPN
 import torchvision.models as models
+from .models import *
 from torchvision.models import ResNeXt101_32X8D_Weights
 
 def copypaste_collate_fn(batch):
@@ -295,9 +296,14 @@ def main(args):
     if "rcnn" in args.model:
         if args.rpn_score_thresh is not None:
             kwargs["rpn_score_thresh"] = args.rpn_score_thresh
-    model = torchvision.models.get_model(
-        args.model, weights=args.weights, weights_backbone=args.weights_backbone, num_classes=num_classes, **kwargs
-    )
+    if args.model == "my_maskrcnn":
+        model = my_maskrcnn_resnet50_fpn(
+            weights=args.weights, weights_backbone=args.weights_backbone, num_classes=num_classes, **kwargs
+        )
+    else:
+        model = torchvision.models.get_model(
+            args.model, weights=args.weights, weights_backbone=args.weights_backbone, num_classes=num_classes, **kwargs
+        )
     model.to(device)
     if args.distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
