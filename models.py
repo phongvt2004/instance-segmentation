@@ -504,13 +504,25 @@ def my_maskrcnn_swin_t_fpn(
         # Create an instance of our custom wrapper
         custom_backbone = CustomSwinFPN(
             body=body,
-            return_layer_keys=extractor_output_keys,  # Pass the keys body will return
-            fpn_in_channels_list=fpn_in_channels_list,
-            fpn_out_channels=FPN_OUT_CHANNELS,
-            # Optional: Add extra_blocks for P6 if needed for your MaskRCNN config
-            # extra_blocks=LastLevelMaxPool()
+            return_layer_keys=extractor_output_keys,  # ['feat0', 'feat1', 'feat2', 'feat3']
+            fpn_in_channels_list=fpn_in_channels_list,  # [96, 192, 384, 768]
+            fpn_out_channels=FPN_OUT_CHANNELS,  # 256
+            # ---- ADD THIS LINE ----
+            extra_blocks=LastLevelMaxPool()  # Creates P6 from the highest level FPN output (P5)
+            # -----------------------
         )
-        print("CustomSwinFPN created successfully.")
+        print("CustomSwinFPN created successfully (with P6).")
+
+        # --- Optional: Verify backbone output ---
+        # custom_backbone.eval()
+        # test_input_verify = torch.randn(1, 3, 800, 800) # Use a realistic size
+        # with torch.no_grad():
+        #     test_output_verify = custom_backbone(test_input_verify)
+        # print("Custom backbone output keys:", test_output_verify.keys()) # Should now include 'pool' key for P6
+        # for k, v in test_output_verify.items():
+        #     print(f"  Key: {k}, Shape: {v.shape}")
+        # ----------------------------------------
+
     except Exception as e:
         import traceback
         print(f"\nError creating CustomSwinFPN: {e}")
@@ -520,10 +532,12 @@ def my_maskrcnn_swin_t_fpn(
     # --- 6. Create the Mask R-CNN Model ---
     print("Creating MaskRCNN model...")
     try:
-        # Pass our custom backbone to MaskRCNN
+        # Pass our custom backbone (now with 5 output levels: 0, 1, 2, 3, pool)
+        # The default AnchorGenerator *should* now be compatible
         model = MaskRCNN(
-            custom_backbone,  # Use our custom wrapper
+            custom_backbone,  # Use our custom wrapper with P6
             num_classes=NUM_CLASSES,
+            # No explicit rpn_anchor_generator needed for now, assuming default expects 5 levels
         )
         print("MaskRCNN model created successfully.")
     except Exception as e:
