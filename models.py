@@ -520,8 +520,9 @@ def my_maskrcnn_swin_t_fpn(
 
 if __name__ == "__main__":
     # Example usage
-    login(token=os.getenv("HUGGINGFACE_TOKEN"))
-    model = my_maskrcnn_swin_t_fpn()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # login(token=os.getenv("HUGGINGFACE_TOKEN"))
+    model = my_maskrcnn_swin_t_fpn().to(device)
     model.eval()
     print(model)
     x = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
