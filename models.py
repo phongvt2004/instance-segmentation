@@ -1,6 +1,6 @@
 import numpy as np
 import torchvision
-from torchvision.models import ResNet50_Weights, resnet50
+from torchvision.models import ResNet50_Weights, resnet50, Swin_T_Weights, swin_t
 from huggingface_hub import login
 import os
 from torchvision.models.detection import MaskRCNN, MaskRCNN_ResNet50_FPN_Weights
