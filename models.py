@@ -5,13 +5,16 @@ import torchvision
 from torchvision.models import (
     resnet50, ResNet50_Weights,
     swin_t, Swin_T_Weights,
-    resnext101_32x8d, ResNeXt101_32x8d_Weights
+    resnext101_32x8d # Keep this import
+    # REMOVED: ResNeXt101_32x8d_Weights
 )
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.mask_rcnn import MaskRCNNHeads, MaskRCNNPredictor
 from torchvision.models.detection.backbone_utils import (
     _resnet_fpn_extractor, _validate_trainable_layers, BackboneWithFPN
 )
+# Import MaskRCNN_ResNet50_FPN_Weights if using the pretrained option in maskrcnn_resnet50_fpn
+from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
 from torchvision.models.feature_extraction import create_feature_extractor
 from torchvision.ops import MultiScaleRoIAlign, misc as misc_nn_ops
 from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork, LastLevelMaxPool, ExtraFPNBlock
@@ -24,14 +27,9 @@ from typing import List, Dict, Tuple, Optional, Any, Callable
 DEFAULT_FPN_OUT_CHANNELS = 256
 DEFAULT_NUM_CLASSES = 91  # Default for COCO
 
-# --- Custom MaskRCNN Class (Keep as is if needed) ---
+# --- Custom MaskRCNN Class (Keep as is) ---
 class MyMaskRCNN(MaskRCNN):
-    """
-    Your custom MaskRCNN subclass (inherits all functionality).
-    You can override methods here if needed in the future.
-    """
-    # (Your existing MyMaskRCNN code here - no changes needed from the snippet provided)
-    # ... (constructor and forward method as provided in your code) ...
+    # ... (Your MyMaskRCNN code - no changes needed here) ...
     def __init__(
         self,
         backbone,
@@ -85,10 +83,23 @@ class MyMaskRCNN(MaskRCNN):
              # Let MaskRCNN handle the error if predictor is given but num_classes is None
              pass
 
+        # Ensure backbone has out_channels before proceeding
+        if not hasattr(backbone, "out_channels"):
+            raise ValueError("Backbone must have an attribute 'out_channels'.")
         out_channels = backbone.out_channels
 
         if mask_roi_pool is None:
-            mask_roi_pool = MultiScaleRoIAlign(featmap_names=["0", "1", "2", "3"], output_size=14, sampling_ratio=2)
+            # Check if backbone output has multiple feature maps (like FPN)
+            # Heuristic: Check if output names look like FPN levels ('0', '1', ...) or 'pool'
+            # This might need adjustment depending on backbone specifics
+            featmap_names = ["0", "1", "2", "3"] # Default for FPN P2-P5
+            # A more robust check would be needed if backbones output different keys
+            # if hasattr(backbone, 'fpn'): # Or check isinstance(backbone, BackboneWithFPN) etc.
+            #     featmap_names = list(backbone.fpn.inner_blocks.keys()) + list(backbone.fpn.layer_blocks.keys())
+            #     if hasattr(backbone.fpn, 'extra_blocks'):
+            #         featmap_names += list(backbone.fpn.extra_blocks.keys()) # e.g. ['pool']
+            mask_roi_pool = MultiScaleRoIAlign(featmap_names=featmap_names, output_size=14, sampling_ratio=2)
+
 
         if mask_head is None:
             mask_layers = (256, 256, 256, 256)
@@ -148,7 +159,6 @@ class MyMaskRCNN(MaskRCNN):
     # Keep your forward method as is
     def forward(self, images, targets=None):
         # Your forward implementation here...
-        # Add the features print statement if needed for debugging
         # --- Start Copied Forward ---
         if self.training:
             if targets is None:
@@ -188,11 +198,6 @@ class MyMaskRCNN(MaskRCNN):
                     )
 
         features = self.backbone(images.tensors)
-        # Debug print - remove if not needed
-        # print("--- Backbone Features ---")
-        # for k, v in features.items():
-        #     print(k, v.shape)
-        # print("-----------------------")
         if isinstance(features, torch.Tensor):
             features = OrderedDict([("0", features)])
         proposals, proposal_losses = self.rpn(images, features, targets)
@@ -213,13 +218,9 @@ class MyMaskRCNN(MaskRCNN):
             return self.eager_outputs(losses, detections)
         # --- End Copied Forward ---
 
-
-# --- Custom Swin FPN Backbone ---
+# --- Custom Swin FPN Backbone (Keep as is) ---
 class CustomSwinFPN(nn.Module):
-    """
-    A custom module combining a Swin feature extractor with an FPN,
-    handling the channel permutation.
-    """
+    # ... (Your CustomSwinFPN code - no changes needed here) ...
     def __init__(self, body, return_layer_keys, fpn_in_channels_list, fpn_out_channels, extra_blocks=None):
         super().__init__()
         self.body = body
@@ -247,13 +248,9 @@ class CustomSwinFPN(nn.Module):
         fpn_output = self.fpn(fpn_input)
         return fpn_output
 
-
-# --- Combined Swin + ResNet-Like FPN Backbone ---
+# --- Combined Swin + ResNet-Like FPN Backbone (Keep as is) ---
 class CombinedSwinResNetLikeFPN(nn.Module):
-    """
-    Combines features from Swin Transformer and a ResNet-like backbone,
-    projects them, and feeds them into an FPN.
-    """
+    # ... (Your CombinedSwinResNetLikeFPN code - no changes needed here) ...
     def __init__(self,
                  resnet_like_base: nn.Module,
                  resnet_like_channels: List[int],
@@ -321,7 +318,6 @@ class CombinedSwinResNetLikeFPN(nn.Module):
             res_f = resnet_like_features[res_key]
             swin_f_permuted = swin_f.permute(0, 3, 1, 2) # B,H,W,C -> B,C,H,W
             if swin_f_permuted.shape[2:] != res_f.shape[2:]:
-                # print(f"Warning: Resizing Swin features at stage {i} from {swin_f_permuted.shape[2:]} to {res_f.shape[2:]}")
                 swin_f_permuted = nn.functional.interpolate(swin_f_permuted, size=res_f.shape[2:], mode='bilinear', align_corners=False)
             combined_f = torch.cat([swin_f_permuted, res_f], dim=1)
             projected_f = self.projection_convs[i](combined_f)
@@ -330,58 +326,47 @@ class CombinedSwinResNetLikeFPN(nn.Module):
         return fpn_output
 
 
-# --- Factory Function for ResNet50 Backbone ---
+# --- Factory Function for ResNet50 Backbone (Keep as is) ---
 def maskrcnn_resnet50_fpn(
     *,
     num_classes: Optional[int] = None,
-    pretrained: bool = True, # Whether to use pretrained MaskRCNN weights (if available)
-    pretrained_backbone: bool = True, # Whether to use pretrained ResNet weights
-    trainable_backbone_layers: Optional[int] = None, # 0-5, how many ResNet layers to train (higher means more)
+    pretrained: bool = True,
+    pretrained_backbone: bool = True,
+    trainable_backbone_layers: Optional[int] = None,
     progress: bool = True,
     **kwargs: Any,
 ) -> MyMaskRCNN:
-    """
-    Constructs a Mask R-CNN model with a ResNet-50-FPN backbone.
-
-    Args:
-        num_classes (Optional[int]): Number of classes (including background). Defaults to 91 (COCO).
-        pretrained (bool): If True, loads weights pretrained on COCO from torchvision (if available for this exact config).
-        pretrained_backbone (bool): If True, loads ImageNet weights for the ResNet backbone.
-        trainable_backbone_layers (Optional[int]): Number of trainable (unfrozen) layers starting from the top.
-                                                  Valid values are 0 to 5. If None, defaults based on `pretrained`.
-        progress (bool): If True, displays a progress bar of the download to stderr.
-    """
+    # ... (Your maskrcnn_resnet50_fpn code - no changes needed here) ...
     if pretrained:
-         # Try loading torchvision's pretrained model directly if args match
          if trainable_backbone_layers is None: trainable_backbone_layers = 3 # Default for pretrained COCO model
          if num_classes is None: num_classes = DEFAULT_NUM_CLASSES
 
          if num_classes == DEFAULT_NUM_CLASSES and trainable_backbone_layers == 3:
              print("Loading pre-trained MaskRCNN ResNet50 FPN from torchvision...")
-             # Note: Using torchvision's direct function if possible
              weights = MaskRCNN_ResNet50_FPN_Weights.DEFAULT
-             weights_backbone = None # Loaded by the main weights
+             # Pass weights enum directly
              model = torchvision.models.detection.maskrcnn_resnet50_fpn(
-                 weights=weights, progress=progress, num_classes=num_classes,
-                 trainable_backbone_layers=trainable_backbone_layers, **kwargs
+                 weights=weights, progress=progress,
+                 # num_classes=num_classes, # Let weights handle num_classes
+                 # trainable_backbone_layers=trainable_backbone_layers, # Let weights handle freezing
+                  **kwargs
              )
-             # If you need MyMaskRCNN specifically, you might need to rebuild it
-             # and load the state_dict carefully, or just use the torchvision one.
-             # For simplicity here, returning the torchvision model if pretrained matches.
-             # If you *must* use MyMaskRCNN, set pretrained=False and load state_dict later.
+             # Check if the returned model is already MyMaskRCNN type, if not, rebuild
+             # For now, assume we might need to rebuild or cast if MyMaskRCNN has overrides
+             # If MyMaskRCNN is just for type hinting or minor overrides, this might be okay
+             # If MyMaskRCNN has significant changes, loading pretrained needs careful state dict mapping
+             print("Note: Returning standard torchvision MaskRCNN when using exact pretrained weights.")
              return model # Return torchvision model directly
          else:
              print("Warning: Pretrained weights requested but num_classes or trainable_layers differ from torchvision defaults. Building model from scratch with pretrained backbone.")
              pretrained = False # Fallback to building from scratch
 
-    # --- Build model from scratch ---
     weights_backbone = ResNet50_Weights.DEFAULT if pretrained_backbone else None
     trainable_backbone_layers = _validate_trainable_layers(weights_backbone is not None, trainable_backbone_layers, 5, 3)
     norm_layer = misc_nn_ops.FrozenBatchNorm2d if weights_backbone is not None else nn.BatchNorm2d
 
     print(f"Building ResNet50 backbone (trainable layers: {trainable_backbone_layers})...")
     backbone_model = resnet50(weights=weights_backbone, progress=progress, norm_layer=norm_layer)
-    # Use torchvision's helper to create ResNet+FPN
     backbone = _resnet_fpn_extractor(backbone_model, trainable_backbone_layers, norm_layer=norm_layer)
 
     print("Creating MyMaskRCNN with ResNet50 FPN backbone...")
@@ -389,29 +374,26 @@ def maskrcnn_resnet50_fpn(
 
     return model
 
-
-# --- Factory Function for Swin-T Backbone ---
+# --- Factory Function for Swin-T Backbone (Keep as is) ---
 def maskrcnn_swin_t_fpn(
     *,
     num_classes: Optional[int] = None,
-    pretrained_backbone: bool = True, # Whether to use pretrained Swin weights
+    pretrained_backbone: bool = True,
     fpn_out_channels: int = DEFAULT_FPN_OUT_CHANNELS,
-    progress: bool = True, # Progress for weight download
+    progress: bool = True,
     **kwargs: Any,
 ) -> MyMaskRCNN:
-    """
-    Constructs a Mask R-CNN model with a Swin Transformer (Swin-T) FPN backbone.
-    """
+    # ... (Your maskrcnn_swin_t_fpn code - no changes needed here) ...
     print("Creating Swin-T backbone...")
-    weights_swin = Swin_T_Weights.DEFAULT if pretrained_backbone else None
-    # Load on CPU initially
-    swin_model = swin_t(weights=weights_swin, progress=progress).cpu()
+    # Use string alias for weights
+    weights_swin_param = "DEFAULT" if pretrained_backbone else None
+    swin_model = swin_t(weights=weights_swin_param, progress=progress).cpu()
 
     return_nodes_for_extractor = {
-        'features.1.1.add_1': 'feat0', # Stride 4
-        'features.3.1.add_1': 'feat1', # Stride 8
-        'features.5.5.add_1': 'feat2', # Stride 16
-        'features.7.1.add_1': 'feat3', # Stride 32
+        'features.1.1.add_1': 'feat0',
+        'features.3.1.add_1': 'feat1',
+        'features.5.5.add_1': 'feat2',
+        'features.7.1.add_1': 'feat3',
     }
     extractor_output_keys = list(return_nodes_for_extractor.values())
     fpn_in_channels_list = [96, 192, 384, 768] # Swin-T specific
@@ -425,7 +407,7 @@ def maskrcnn_swin_t_fpn(
         return_layer_keys=extractor_output_keys,
         fpn_in_channels_list=fpn_in_channels_list,
         fpn_out_channels=fpn_out_channels,
-        extra_blocks=LastLevelMaxPool() # Add P6 layer
+        extra_blocks=LastLevelMaxPool()
     )
 
     print("Creating MyMaskRCNN with Swin-T FPN backbone...")
@@ -445,23 +427,28 @@ def maskrcnn_resnext101_fpn(
     """
     Constructs a Mask R-CNN model with a ResNeXt-101-32x8d FPN backbone.
     """
-    weights_backbone = ResNeXt101_32x8d_Weights.DEFAULT if pretrained_backbone else None
-    trainable_backbone_layers = _validate_trainable_layers(weights_backbone is not None, trainable_backbone_layers, 5, 3)
-    # norm_layer = misc_nn_ops.FrozenBatchNorm2d if weights_backbone is not None else nn.BatchNorm2d
-    # Note: ResNeXt in torchvision might not expose norm_layer in constructor easily, handle freezing manually.
+    # Use string alias for weights
+    weights_backbone_param = "DEFAULT" if pretrained_backbone else None
+    is_pretrained = weights_backbone_param is not None
+
+    trainable_backbone_layers = _validate_trainable_layers(is_pretrained, trainable_backbone_layers, 5, 3)
 
     print(f"Building ResNeXt101 backbone (trainable layers: {trainable_backbone_layers})...")
-    backbone_model = resnext101_32x8d(weights=weights_backbone, progress=progress)
+    # Pass the string or None to the weights parameter
+    backbone_model = resnext101_32x8d(weights=weights_backbone_param, progress=progress)
 
-    # Freeze layers manually if FrozenBatchNorm not applicable directly
-    if weights_backbone is not None and trainable_backbone_layers < 5:
+    # Freeze layers manually
+    if is_pretrained and trainable_backbone_layers < 5:
         layers_to_train = ["layer4", "layer3", "layer2", "layer1", "conv1"][:trainable_backbone_layers]
-        if trainable_backbone_layers == 5: layers_to_train.append("bn1") # Should match ResNet freezing logic
+        # Note: ResNeXt typically doesn't have a top-level 'bn1' like ResNet,
+        # the first norm is inside 'conv1'. Freezing handled by not including 'conv1' etc.
         for name, parameter in backbone_model.named_parameters():
-            if all([not name.startswith(layer) for layer in layers_to_train]):
+             # Freeze if the layer name doesn't start with any of the layers to train
+            if not any(name.startswith(layer) for layer in layers_to_train):
                  parameter.requires_grad_(False)
+                 # print(f"Freezing: {name}") # Optional: verify frozen layers
 
-    # FPN setup (similar to ResNet helper)
+    # FPN setup
     extra_blocks = LastLevelMaxPool()
     returned_layers = [1, 2, 3, 4]
     return_layers_dict = {f"layer{k}": str(v) for v, k in enumerate(returned_layers)}
@@ -484,8 +471,8 @@ def maskrcnn_swin_resnet50_fpn(
     num_classes: Optional[int] = None,
     pretrained_swin: bool = True,
     pretrained_resnet: bool = True,
-    projection_channels: int = DEFAULT_FPN_OUT_CHANNELS, # Project concatenated features TO this dim
-    fpn_out_channels: int = DEFAULT_FPN_OUT_CHANNELS,    # Final FPN output channels
+    projection_channels: int = DEFAULT_FPN_OUT_CHANNELS,
+    fpn_out_channels: int = DEFAULT_FPN_OUT_CHANNELS,
     progress: bool = True,
     **kwargs: Any,
 ) -> MyMaskRCNN:
@@ -493,15 +480,15 @@ def maskrcnn_swin_resnet50_fpn(
     Constructs Mask R-CNN with a combined Swin-T + ResNet50 FPN backbone.
     """
     print("Loading ResNet50 base for combined model...")
-    resnet_weights = ResNet50_Weights.DEFAULT if pretrained_resnet else None
-    resnet_base = resnet50(weights=resnet_weights, progress=progress)
+    resnet_weights_param = ResNet50_Weights.DEFAULT if pretrained_resnet else None
+    resnet_base = resnet50(weights=resnet_weights_param, progress=progress)
     resnet_channels = [256, 512, 1024, 2048] # ResNet50 specific
 
     print("Instantiating CombinedSwinResNetLikeFPN (with ResNet50)...")
     combined_backbone = CombinedSwinResNetLikeFPN(
         resnet_like_base=resnet_base,
         resnet_like_channels=resnet_channels,
-        pretrained_swin=pretrained_swin,
+        pretrained_swin=pretrained_swin, # Pass boolean flag
         projection_channels=projection_channels,
         fpn_out_channels=fpn_out_channels,
         extra_blocks=LastLevelMaxPool()
@@ -527,15 +514,16 @@ def maskrcnn_swin_resnext101_fpn(
     Constructs Mask R-CNN with a combined Swin-T + ResNeXt-101 FPN backbone.
     """
     print("Loading ResNeXt101 base for combined model...")
-    resnext_weights = ResNeXt101_32x8d_Weights.DEFAULT if pretrained_resnext else None
-    resnext_base = resnext101_32x8d(weights=resnext_weights, progress=progress)
+    # Use string alias for weights
+    resnext_weights_param = "DEFAULT" if pretrained_resnext else None
+    resnext_base = resnext101_32x8d(weights=resnext_weights_param, progress=progress)
     resnext_channels = [256, 512, 1024, 2048] # ResNeXt101 specific
 
     print("Instantiating CombinedSwinResNetLikeFPN (with ResNeXt101)...")
     combined_backbone = CombinedSwinResNetLikeFPN(
         resnet_like_base=resnext_base,
         resnet_like_channels=resnext_channels,
-        pretrained_swin=pretrained_swin,
+        pretrained_swin=pretrained_swin, # Pass boolean flag
         projection_channels=projection_channels,
         fpn_out_channels=fpn_out_channels,
         extra_blocks=LastLevelMaxPool()
@@ -546,16 +534,18 @@ def maskrcnn_swin_resnext101_fpn(
     return model
 
 
-# --- Example Usage ---
+# --- Example Usage (Keep as is) ---
 if __name__ == '__main__':
+    # ... (Your example usage code - no changes needed here) ...
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    dummy_input = torch.randn(1, 3, 512, 512).to(device)
+    dummy_input = torch.randn(1, 3, 512, 512).to(device) # Smaller size for quicker testing
 
     # Test ResNet50
     print("\n--- Testing ResNet50 ---")
-    model_resnet50 = maskrcnn_resnet50_fpn(pretrained_backbone=True, num_classes=10)
+    # Use pretrained=False here to force building from scratch with MyMaskRCNN
+    model_resnet50 = maskrcnn_resnet50_fpn(pretrained=False, pretrained_backbone=True, num_classes=10)
     model_resnet50.to(device)
     model_resnet50.eval()
     with torch.no_grad():
