@@ -1,162 +1,37 @@
-import numpy as np
-import torchvision
-from torchvision.models import ResNet50_Weights, resnet50, Swin_T_Weights, swin_t
-from huggingface_hub import login
-import os
-from torchvision.models.detection import MaskRCNN, MaskRCNN_ResNet50_FPN_Weights
-from torchvision.models.detection.mask_rcnn import MaskRCNNHeads, MaskRCNNPredictor
-from torchvision.models.feature_extraction import create_feature_extractor, get_graph_node_names
-from torchvision.ops import MultiScaleRoIAlign, misc as misc_nn_ops
 import torch
-import warnings
-from collections import OrderedDict
-from typing import List, Dict, Tuple, Optional, Any
-from torch import Tensor, nn
-from torchvision.models.detection.backbone_utils import _resnet_fpn_extractor, _validate_trainable_layers, \
-    BackboneWithFPN
-from transformers import ViTModel, ViTConfig, AutoProcessor
-from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork, LastLevelMaxPool
-from dotenv import load_dotenv
+import torch.nn as nn
+from torch import Tensor
+import torchvision
+from torchvision.models import (
+    resnet50, ResNet50_Weights,
+    swin_t, Swin_T_Weights,
+    resnext101_32x8d, ResNeXt101_32x8d_Weights
+)
+from torchvision.models.detection import MaskRCNN
+from torchvision.models.detection.mask_rcnn import MaskRCNNHeads, MaskRCNNPredictor
+from torchvision.models.detection.backbone_utils import (
+    _resnet_fpn_extractor, _validate_trainable_layers, BackboneWithFPN
+)
+from torchvision.models.feature_extraction import create_feature_extractor
+from torchvision.ops import MultiScaleRoIAlign, misc as misc_nn_ops
+from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork, LastLevelMaxPool, ExtraFPNBlock
 
-load_dotenv()
+from collections import OrderedDict
+import warnings
+from typing import List, Dict, Tuple, Optional, Any, Callable
+
+# --- Constants ---
+DEFAULT_FPN_OUT_CHANNELS = 256
+DEFAULT_NUM_CLASSES = 91  # Default for COCO
+
+# --- Custom MaskRCNN Class (Keep as is if needed) ---
 class MyMaskRCNN(MaskRCNN):
     """
-    Implements Mask R-CNN.
-
-    The input to the model is expected to be a list of tensors, each of shape [C, H, W], one for each
-    image, and should be in 0-1 range. Different images can have different sizes.
-
-    The behavior of the model changes depending on if it is in training or evaluation mode.
-
-    During training, the model expects both the input tensors and targets (list of dictionary),
-    containing:
-        - boxes (``FloatTensor[N, 4]``): the ground-truth boxes in ``[x1, y1, x2, y2]`` format, with
-          ``0 <= x1 < x2 <= W`` and ``0 <= y1 < y2 <= H``.
-        - labels (Int64Tensor[N]): the class label for each ground-truth box
-        - masks (UInt8Tensor[N, H, W]): the segmentation binary masks for each instance
-
-    The model returns a Dict[Tensor] during training, containing the classification and regression
-    losses for both the RPN and the R-CNN, and the mask loss.
-
-    During inference, the model requires only the input tensors, and returns the post-processed
-    predictions as a List[Dict[Tensor]], one for each input image. The fields of the Dict are as
-    follows:
-        - boxes (``FloatTensor[N, 4]``): the predicted boxes in ``[x1, y1, x2, y2]`` format, with
-          ``0 <= x1 < x2 <= W`` and ``0 <= y1 < y2 <= H``.
-        - labels (Int64Tensor[N]): the predicted labels for each image
-        - scores (Tensor[N]): the scores or each prediction
-        - masks (UInt8Tensor[N, 1, H, W]): the predicted masks for each instance, in 0-1 range. In order to
-          obtain the final segmentation masks, the soft masks can be thresholded, generally
-          with a value of 0.5 (mask >= 0.5)
-
-    Args:
-        backbone (nn.Module): the network used to compute the features for the model.
-            It should contain an out_channels attribute, which indicates the number of output
-            channels that each feature map has (and it should be the same for all feature maps).
-            The backbone should return a single Tensor or and OrderedDict[Tensor].
-        num_classes (int): number of output classes of the model (including the background).
-            If box_predictor is specified, num_classes should be None.
-        min_size (int): Images are rescaled before feeding them to the backbone:
-            we attempt to preserve the aspect ratio and scale the shorter edge
-            to ``min_size``. If the resulting longer edge exceeds ``max_size``,
-            then downscale so that the longer edge does not exceed ``max_size``.
-            This may result in the shorter edge beeing lower than ``min_size``.
-        max_size (int): See ``min_size``.
-        image_mean (Tuple[float, float, float]): mean values used for input normalization.
-            They are generally the mean values of the dataset on which the backbone has been trained
-            on
-        image_std (Tuple[float, float, float]): std values used for input normalization.
-            They are generally the std values of the dataset on which the backbone has been trained on
-        rpn_anchor_generator (AnchorGenerator): module that generates the anchors for a set of feature
-            maps.
-        rpn_head (nn.Module): module that computes the objectness and regression deltas from the RPN
-        rpn_pre_nms_top_n_train (int): number of proposals to keep before applying NMS during training
-        rpn_pre_nms_top_n_test (int): number of proposals to keep before applying NMS during testing
-        rpn_post_nms_top_n_train (int): number of proposals to keep after applying NMS during training
-        rpn_post_nms_top_n_test (int): number of proposals to keep after applying NMS during testing
-        rpn_nms_thresh (float): NMS threshold used for postprocessing the RPN proposals
-        rpn_fg_iou_thresh (float): minimum IoU between the anchor and the GT box so that they can be
-            considered as positive during training of the RPN.
-        rpn_bg_iou_thresh (float): maximum IoU between the anchor and the GT box so that they can be
-            considered as negative during training of the RPN.
-        rpn_batch_size_per_image (int): number of anchors that are sampled during training of the RPN
-            for computing the loss
-        rpn_positive_fraction (float): proportion of positive anchors in a mini-batch during training
-            of the RPN
-        rpn_score_thresh (float): only return proposals with an objectness score greater than rpn_score_thresh
-        box_roi_pool (MultiScaleRoIAlign): the module which crops and resizes the feature maps in
-            the locations indicated by the bounding boxes
-        box_head (nn.Module): module that takes the cropped feature maps as input
-        box_predictor (nn.Module): module that takes the output of box_head and returns the
-            classification logits and box regression deltas.
-        box_score_thresh (float): during inference, only return proposals with a classification score
-            greater than box_score_thresh
-        box_nms_thresh (float): NMS threshold for the prediction head. Used during inference
-        box_detections_per_img (int): maximum number of detections per image, for all classes.
-        box_fg_iou_thresh (float): minimum IoU between the proposals and the GT box so that they can be
-            considered as positive during training of the classification head
-        box_bg_iou_thresh (float): maximum IoU between the proposals and the GT box so that they can be
-            considered as negative during training of the classification head
-        box_batch_size_per_image (int): number of proposals that are sampled during training of the
-            classification head
-        box_positive_fraction (float): proportion of positive proposals in a mini-batch during training
-            of the classification head
-        bbox_reg_weights (Tuple[float, float, float, float]): weights for the encoding/decoding of the
-            bounding boxes
-        mask_roi_pool (MultiScaleRoIAlign): the module which crops and resizes the feature maps in
-             the locations indicated by the bounding boxes, which will be used for the mask head.
-        mask_head (nn.Module): module that takes the cropped feature maps as input
-        mask_predictor (nn.Module): module that takes the output of the mask_head and returns the
-            segmentation mask logits
-
-    Example::
-
-        >>> import torch
-        >>> import torchvision
-        >>> from torchvision.models.detection import MaskRCNN
-        >>> from torchvision.models.detection.anchor_utils import AnchorGenerator
-        >>>
-        >>> # load a pre-trained model for classification and return
-        >>> # only the features
-        >>> backbone = torchvision.models.mobilenet_v2(weights=MobileNet_V2_Weights.DEFAULT).features
-        >>> # MaskRCNN needs to know the number of
-        >>> # output channels in a backbone. For mobilenet_v2, it's 1280
-        >>> # so we need to add it here,
-        >>> backbone.out_channels = 1280
-        >>>
-        >>> # let's make the RPN generate 5 x 3 anchors per spatial
-        >>> # location, with 5 different sizes and 3 different aspect
-        >>> # ratios. We have a Tuple[Tuple[int]] because each feature
-        >>> # map could potentially have different sizes and
-        >>> # aspect ratios
-        >>> anchor_generator = AnchorGenerator(sizes=((32, 64, 128, 256, 512),),
-        >>>                                    aspect_ratios=((0.5, 1.0, 2.0),))
-        >>>
-        >>> # let's define what are the feature maps that we will
-        >>> # use to perform the region of interest cropping, as well as
-        >>> # the size of the crop after rescaling.
-        >>> # if your backbone returns a Tensor, featmap_names is expected to
-        >>> # be ['0']. More generally, the backbone should return an
-        >>> # OrderedDict[Tensor], and in featmap_names you can choose which
-        >>> # feature maps to use.
-        >>> roi_pooler = torchvision.ops.MultiScaleRoIAlign(featmap_names=['0'],
-        >>>                                                 output_size=7,
-        >>>                                                 sampling_ratio=2)
-        >>>
-        >>> mask_roi_pooler = torchvision.ops.MultiScaleRoIAlign(featmap_names=['0'],
-        >>>                                                      output_size=14,
-        >>>                                                      sampling_ratio=2)
-        >>> # put the pieces together inside a MaskRCNN model
-        >>> model = MaskRCNN(backbone,
-        >>>                  num_classes=2,
-        >>>                  rpn_anchor_generator=anchor_generator,
-        >>>                  box_roi_pool=roi_pooler,
-        >>>                  mask_roi_pool=mask_roi_pooler)
-        >>> model.eval()
-        >>> x = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
-        >>> predictions = model(x)
+    Your custom MaskRCNN subclass (inherits all functionality).
+    You can override methods here if needed in the future.
     """
-
+    # (Your existing MyMaskRCNN code here - no changes needed from the snippet provided)
+    # ... (constructor and forward method as provided in your code) ...
     def __init__(
         self,
         backbone,
@@ -203,9 +78,12 @@ class MyMaskRCNN(MaskRCNN):
                 f"mask_roi_pool should be of type MultiScaleRoIAlign or None instead of {type(mask_roi_pool)}"
             )
 
-        if num_classes is not None:
-            if mask_predictor is not None:
-                raise ValueError("num_classes should be None when mask_predictor is specified")
+        # Handle num_classes default if not provided
+        if num_classes is None and box_predictor is None and mask_predictor is None:
+             num_classes = DEFAULT_NUM_CLASSES
+        elif num_classes is None and (box_predictor is not None or mask_predictor is not None):
+             # Let MaskRCNN handle the error if predictor is given but num_classes is None
+             pass
 
         out_channels = backbone.out_channels
 
@@ -218,9 +96,13 @@ class MyMaskRCNN(MaskRCNN):
             mask_head = MaskRCNNHeads(out_channels, mask_layers, mask_dilation)
 
         if mask_predictor is None:
-            mask_predictor_in_channels = 256  # == mask_layers[-1]
-            mask_dim_reduced = 256
-            mask_predictor = MaskRCNNPredictor(mask_predictor_in_channels, mask_dim_reduced, num_classes)
+            # Avoid error if num_classes is None because predictor was provided
+            if num_classes is not None:
+                 mask_predictor_in_channels = 256  # == mask_layers[-1]
+                 mask_dim_reduced = 256
+                 mask_predictor = MaskRCNNPredictor(mask_predictor_in_channels, mask_dim_reduced, num_classes)
+            else:
+                 mask_predictor = None # Let superclass handle predictor logic
 
         super().__init__(
             backbone,
@@ -255,6 +137,7 @@ class MyMaskRCNN(MaskRCNN):
             box_batch_size_per_image,
             box_positive_fraction,
             bbox_reg_weights,
+            # Mask parameters specific to MaskRCNN (handled below)
             **kwargs,
         )
 
@@ -262,21 +145,11 @@ class MyMaskRCNN(MaskRCNN):
         self.roi_heads.mask_head = mask_head
         self.roi_heads.mask_predictor = mask_predictor
 
+    # Keep your forward method as is
     def forward(self, images, targets=None):
-        # type: (List[Tensor], Optional[List[Dict[str, Tensor]]]) -> Tuple[Dict[str, Tensor], List[Dict[str, Tensor]]]
-        """
-        Args:
-            images (list[Tensor]): images to be processed
-            targets (list[Dict[str, Tensor]]): ground-truth boxes present in the image (optional)
-
-        Returns:
-            result (list[BoxList] or dict[Tensor]): the output from the model.
-                During training, it returns a dict[Tensor] which contains the losses.
-                During testing, it returns list[BoxList] contains additional fields
-                like `scores`, `labels` and `mask` (for Mask R-CNN models).
-
-        """
-
+        # Your forward implementation here...
+        # Add the features print statement if needed for debugging
+        # --- Start Copied Forward ---
         if self.training:
             if targets is None:
                 torch._assert(False, "targets should not be none when in training mode")
@@ -301,14 +174,11 @@ class MyMaskRCNN(MaskRCNN):
             original_image_sizes.append((val[0], val[1]))
         images, targets = self.transform(images, targets)
 
-        # Check for degenerate boxes
-        # TODO: Move this to a function
         if targets is not None:
             for target_idx, target in enumerate(targets):
                 boxes = target["boxes"]
                 degenerate_boxes = boxes[:, 2:] <= boxes[:, :2]
                 if degenerate_boxes.any():
-                    # print the first degenerate box
                     bb_idx = torch.where(degenerate_boxes.any(dim=1))[0][0]
                     degen_bb: List[float] = boxes[bb_idx].tolist()
                     torch._assert(
@@ -318,83 +188,43 @@ class MyMaskRCNN(MaskRCNN):
                     )
 
         features = self.backbone(images.tensors)
-        for k, v in features.items():
-            print(k, v.shape)
+        # Debug print - remove if not needed
+        # print("--- Backbone Features ---")
+        # for k, v in features.items():
+        #     print(k, v.shape)
+        # print("-----------------------")
         if isinstance(features, torch.Tensor):
             features = OrderedDict([("0", features)])
         proposals, proposal_losses = self.rpn(images, features, targets)
         detections, detector_losses = self.roi_heads(features, proposals, images.image_sizes, targets)
-        detections = self.transform.postprocess(detections, images.image_sizes, original_image_sizes)  # type: ignore[operator]
+        detections = self.transform.postprocess(detections, images.image_sizes, original_image_sizes)
 
         losses = {}
         losses.update(detector_losses)
         losses.update(proposal_losses)
 
         if torch.jit.is_scripting():
+            if not hasattr(self, "_has_warned"): self._has_warned = False # Ensure attribute exists
             if not self._has_warned:
                 warnings.warn("RCNN always returns a (Losses, Detections) tuple in scripting")
                 self._has_warned = True
             return losses, detections
         else:
             return self.eager_outputs(losses, detections)
-def my_maskrcnn_resnet50_fpn(
-    *,
-    weights: Optional[str] = None,
-    progress: bool = True,
-    num_classes: Optional[int] = None,
-    weights_backbone: Optional[ResNet50_Weights] = ResNet50_Weights.IMAGENET1K_V1,
-    trainable_backbone_layers: Optional[int] = None,
-    **kwargs: Any,
-    ) -> MyMaskRCNN:
+        # --- End Copied Forward ---
 
-    weights_backbone = ResNet50_Weights.verify(weights_backbone)
 
-    if weights is not None:
-        weights_backbone = None
-        num_classes = 91
-    elif num_classes is None:
-        num_classes = 91
-
-    is_trained = weights is not None or weights_backbone is not None
-    trainable_backbone_layers = _validate_trainable_layers(is_trained, trainable_backbone_layers, 5, 3)
-    norm_layer = misc_nn_ops.FrozenBatchNorm2d if is_trained else nn.BatchNorm2d
-
-    backbone = resnet50(weights=weights_backbone, progress=progress, norm_layer=norm_layer)
-    backbone = _resnet_fpn_extractor(backbone, trainable_backbone_layers)
-    model = MyMaskRCNN(backbone, num_classes=num_classes, **kwargs)
-
-    if weights is not None:
-        model.load_state_dict(weights)
-
-    return model
-
+# --- Custom Swin FPN Backbone ---
 class CustomSwinFPN(nn.Module):
     """
-    A custom module that combines a feature extractor (like one from
-    create_feature_extractor) with a Feature Pyramid Network (FPN).
-
-    Handles the potential mismatch in dictionary keys between the
-    feature extractor output and the FPN input.
+    A custom module combining a Swin feature extractor with an FPN,
+    handling the channel permutation.
     """
     def __init__(self, body, return_layer_keys, fpn_in_channels_list, fpn_out_channels, extra_blocks=None):
-        """
-        Args:
-            body (nn.Module): The feature extractor module (e.g., from create_feature_extractor).
-                              Expected to return a dict[str, Tensor].
-            return_layer_keys (List[str]): The keys that 'body' returns in its output dict,
-                                           in the order corresponding to strides (e.g., ['feat0', 'feat1', 'feat2', 'feat3']).
-            fpn_in_channels_list (List[int]): List of input channels for each FPN level, matching the channels
-                                              of the tensors returned by 'body' for the keys in 'return_layer_keys'.
-            fpn_out_channels (int): The number of output channels for each FPN feature map.
-            extra_blocks (nn.Module, optional): An optional extra block to apply after the last FPN level
-                                                (e.g., LastLevelMaxPool for P6). Defaults to None.
-        """
         super().__init__()
-        self.body = body # The model created by create_feature_extractor
-        self.return_layer_keys = return_layer_keys # e.g., ['feat0', 'feat1', 'feat2', 'feat3']
-        # Map the body output keys to the keys FPN expects ('0', '1', '2', '3')
+        self.body = body
+        self.return_layer_keys = return_layer_keys
         self.fpn_map = {key: str(i) for i, key in enumerate(return_layer_keys)}
-
         print(f"CustomSwinFPN: Mapping body keys {list(self.fpn_map.keys())} to FPN keys {list(self.fpn_map.values())}")
 
         self.fpn = FeaturePyramidNetwork(
@@ -402,281 +232,368 @@ class CustomSwinFPN(nn.Module):
             out_channels=fpn_out_channels,
             extra_blocks=extra_blocks,
         )
-        # IMPORTANT: MaskRCNN and FasterRCNN expect the backbone to have this attribute
-        self.out_channels = fpn_out_channels
+        self.out_channels = fpn_out_channels # Required by MaskRCNN
 
     def forward(self, x):
-        # 1. Get features from the body (feature extractor)
-        # Output format is likely B, H, W, C
-        features = self.body(x)
-
-        # 2. Rename keys AND Permute dimensions for FPN input
+        features = self.body(x) # Expected B, H, W, C
         fpn_input = OrderedDict()
-
         for body_key, fpn_key in self.fpn_map.items():
             if body_key in features:
-                # Get the tensor in B, H, W, C format
                 tensor_bhwc = features[body_key]
-                # Permute to B, C, H, W format expected by Conv2d
-                # (0, 3, 1, 2) means: keep dim 0 as is, move dim 3 to pos 1, dim 1 to pos 2, dim 2 to pos 3
-                tensor_bchw = tensor_bhwc.permute(0, 3, 1, 2)
+                tensor_bchw = tensor_bhwc.permute(0, 3, 1, 2) # Permute B,H,W,C -> B,C,H,W
                 fpn_input[fpn_key] = tensor_bchw
             else:
-                raise KeyError(f"Expected key '{body_key}' not found in feature extractor output. Found keys: {features.keys()}")
-
-        # 3. Pass permuted features (B, C, H, W) to FPN
-        fpn_output = self.fpn(fpn_input) # FPN expects B, C, H, W
-        return fpn_output
-def my_maskrcnn_swin_t_fpn(
-        *,
-        weights: Optional[str] = None,
-        progress: bool = True,
-        num_classes: Optional[int] = None,
-        weights_backbone: Optional[ResNet50_Weights] = ResNet50_Weights.IMAGENET1K_V1,
-        trainable_backbone_layers: Optional[int] = None,
-        **kwargs: Any,
-) -> MyMaskRCNN:
-    NUM_CLASSES = 91
-    PRETRAINED_SWIN = True
-    FPN_OUT_CHANNELS = 256
-
-    # --- 1. Load Swin Model ---
-    weights_swin = torchvision.models.Swin_T_Weights.DEFAULT if PRETRAINED_SWIN else None
-    swin_model = torchvision.models.swin_t(weights=weights_swin).cpu()  # Load on CPU
-
-    # --- 2. Define Nodes and Output Keys for Extractor ---
-    # Use the correct internal node names as keys, and assign simple output keys as values
-    return_nodes_for_extractor = {
-        'features.1.1.add_1': 'feat0',  # Stage 1 out
-        'features.3.1.add_1': 'feat1',  # Stage 2 out
-        'features.5.5.add_1': 'feat2',  # Stage 3 out
-        'features.7.1.add_1': 'feat3',  # Stage 4 out
-    }
-    # Store the output keys in order, corresponding to increasing stride
-    extractor_output_keys = ['feat0', 'feat1', 'feat2', 'feat3']
-
-    # --- 3. Create the Feature Extractor Body ---
-    print("Creating feature extractor body...")
-    try:
-        body = create_feature_extractor(swin_model, return_nodes=return_nodes_for_extractor)
-        print("Feature extractor body created successfully.")
-    except Exception as e:
-        import traceback
-        print(f"\nError creating feature extractor body: {e}")
-        print(traceback.format_exc())
-        exit()
-
-    # --- 4. Define Input Channels for FPN ---
-    # Corresponds channel count for 'feat0', 'feat1', 'feat2', 'feat3' outputs
-    fpn_in_channels_list = [96, 192, 384, 768]  # For Swin-T
-
-    # --- 5. Create the Custom Backbone + FPN ---
-    print("Creating CustomSwinFPN...")
-    try:
-        # Create an instance of our custom wrapper
-        custom_backbone = CustomSwinFPN(
-            body=body,
-            return_layer_keys=extractor_output_keys,  # ['feat0', 'feat1', 'feat2', 'feat3']
-            fpn_in_channels_list=fpn_in_channels_list,  # [96, 192, 384, 768]
-            fpn_out_channels=FPN_OUT_CHANNELS,  # 256
-            # ---- ADD THIS LINE ----
-            extra_blocks=LastLevelMaxPool()  # Creates P6 from the highest level FPN output (P5)
-            # -----------------------
-        )
-        print("CustomSwinFPN created successfully (with P6).")
-
-        # --- Optional: Verify backbone output ---
-        # custom_backbone.eval()
-        # test_input_verify = torch.randn(1, 3, 800, 800) # Use a realistic size
-        # with torch.no_grad():
-        #     test_output_verify = custom_backbone(test_input_verify)
-        # print("Custom backbone output keys:", test_output_verify.keys()) # Should now include 'pool' key for P6
-        # for k, v in test_output_verify.items():
-        #     print(f"  Key: {k}, Shape: {v.shape}")
-        # ----------------------------------------
-
-    except Exception as e:
-        import traceback
-        print(f"\nError creating CustomSwinFPN: {e}")
-        print(traceback.format_exc())
-        exit()
-
-    # --- 6. Create the Mask R-CNN Model ---
-    print("Creating MaskRCNN model...")
-    try:
-        # Pass our custom backbone (now with 5 output levels: 0, 1, 2, 3, pool)
-        # The default AnchorGenerator *should* now be compatible
-        model = MaskRCNN(
-            custom_backbone,  # Use our custom wrapper with P6
-            num_classes=NUM_CLASSES,
-            # No explicit rpn_anchor_generator needed for now, assuming default expects 5 levels
-        )
-        print("MaskRCNN model created successfully.")
-    except Exception as e:
-        import traceback
-        print(f"\nError creating MaskRCNN: {e}")
-        print(traceback.format_exc())
-        print("Ensure custom_backbone has the '.out_channels' attribute set correctly.")
-        exit()
-
-    # if weights is not None:
-    #     model.load_state_dict(weights)
-
-    return model
-
-NUM_CLASSES = 91 # Example: COCO default
-PRETRAINED_SWIN = True
-PRETRAINED_RESNET = True
-PROJECTION_CHANNELS = 256 # Channels AFTER combining Swin+ResNet, before FPN
-FPN_OUT_CHANNELS = 256    # Output channels from each FPN level
-
-
-# --- Combined Backbone + FPN Module ---
-class CombinedSwinResNetFPN(nn.Module):
-    """
-    Combines features from Swin Transformer and ResNet backbones,
-    projects them, and feeds them into an FPN.
-    """
-    def __init__(self, projection_channels, fpn_out_channels, extra_blocks=None):
-        super().__init__()
-
-        # 1. Load Base Models
-        swin_weights = Swin_T_Weights.DEFAULT if PRETRAINED_SWIN else None
-        swin_base = swin_t(weights=swin_weights).cpu()
-
-        resnet_weights = ResNet50_Weights.DEFAULT if PRETRAINED_RESNET else None
-        resnet_base = resnet50(weights=resnet_weights).cpu()
-
-        # 2. Define Nodes for Feature Extraction
-        # Swin-T nodes (B, H, W, C output format)
-        swin_return_nodes = {
-            'features.1.1.add_1': 'swin_feat0', # Stage 1 out (Stride 4) -> 96 C
-            'features.3.1.add_1': 'swin_feat1', # Stage 2 out (Stride 8) -> 192 C
-            'features.5.5.add_1': 'swin_feat2', # Stage 3 out (Stride 16)-> 384 C
-            'features.7.1.add_1': 'swin_feat3', # Stage 4 out (Stride 32)-> 768 C
-        }
-        self.swin_output_keys = list(swin_return_nodes.values())
-
-        # ResNet50 nodes (B, C, H, W output format)
-        # Usually 'layer1', 'layer2', etc. work directly
-        resnet_return_nodes = {
-            'layer1': 'res_feat0', # Stride 4 -> 256 C
-            'layer2': 'res_feat1', # Stride 8 -> 512 C
-            'layer3': 'res_feat2', # Stride 16-> 1024 C
-            'layer4': 'res_feat3', # Stride 32-> 2048 C
-        }
-        self.resnet_output_keys = list(resnet_return_nodes.values())
-
-        # 3. Create Feature Extractors
-        print("Creating Swin feature extractor...")
-        self.body_swin = create_feature_extractor(swin_base, return_nodes=swin_return_nodes)
-        print("Creating ResNet feature extractor...")
-        self.body_resnet = create_feature_extractor(resnet_base, return_nodes=resnet_return_nodes)
-
-        # 4. Calculate Concatenated Channels & Define Projection Layers
-        swin_channels = [96, 192, 384, 768]
-        resnet_channels = [256, 512, 1024, 2048]
-        self.projection_convs = nn.ModuleList()
-        fpn_in_channels_list = []
-
-        print("Creating projection layers:")
-        for i in range(len(swin_channels)):
-            concat_channels = swin_channels[i] + resnet_channels[i]
-            proj_conv = nn.Conv2d(concat_channels, projection_channels, kernel_size=1)
-            self.projection_convs.append(proj_conv)
-            fpn_in_channels_list.append(projection_channels) # FPN input channels are POST projection
-            print(f"  Stage {i}: Concat Channels={concat_channels} -> Projection Conv -> Out Channels={projection_channels}")
-
-        # 5. Create FPN
-        print(f"Creating FPN with input channels: {fpn_in_channels_list}, output channels: {fpn_out_channels}")
-        self.fpn = FeaturePyramidNetwork(
-            in_channels_list=fpn_in_channels_list, # Channels after projection
-            out_channels=fpn_out_channels,
-            extra_blocks=extra_blocks,
-        )
-
-        # Required attribute for MaskRCNN
-        self.out_channels = fpn_out_channels
-
-    def forward(self, x):
-        # Extract features from both backbones
-        swin_features = self.body_swin(x)   # Output: dict[str, Tensor(B,H,W,C)]
-        resnet_features = self.body_resnet(x) # Output: dict[str, Tensor(B,C,H,W)]
-
-        fpn_input = OrderedDict()
-        # Process each stage
-        for i in range(len(self.swin_output_keys)):
-            swin_key = self.swin_output_keys[i]
-            res_key = self.resnet_output_keys[i]
-            fpn_key = str(i) # FPN expects keys '0', '1', '2', '3'
-
-            swin_f = swin_features[swin_key]
-            res_f = resnet_features[res_key]
-
-            # Permute Swin features: B,H,W,C -> B,C,H,W
-            swin_f_permuted = swin_f.permute(0, 3, 1, 2)
-
-            # Concatenate along channel dimension
-            # Ensure spatial dimensions match (should if strides are aligned)
-            if swin_f_permuted.shape[2:] != res_f.shape[2:]:
-                 # Add interpolation if shapes slightly differ (can happen with padding differences)
-                 print(f"Warning: Resizing Swin features at stage {i} from {swin_f_permuted.shape[2:]} to {res_f.shape[2:]}")
-                 swin_f_permuted = nn.functional.interpolate(swin_f_permuted, size=res_f.shape[2:], mode='bilinear', align_corners=False)
-
-            combined_f = torch.cat([swin_f_permuted, res_f], dim=1)
-
-            # Apply projection convolution
-            projected_f = self.projection_convs[i](combined_f)
-
-            # Add to FPN input dictionary
-            fpn_input[fpn_key] = projected_f
-
-        # Pass projected features to FPN
+                raise KeyError(f"Expected key '{body_key}' not found in extractor output. Found keys: {features.keys()}")
         fpn_output = self.fpn(fpn_input)
         return fpn_output
 
-def my_maskrcnn_swin_resnet_fpn(
-        *,
-        weights: Optional[str] = None,
-        progress: bool = True,
-        num_classes: Optional[int] = None,
-        weights_backbone: Optional[ResNet50_Weights] = ResNet50_Weights.IMAGENET1K_V1,
-        trainable_backbone_layers: Optional[int] = None,
-        **kwargs: Any,
-) -> MyMaskRCNN:
-    combined_backbone = CombinedSwinResNetFPN(
-        projection_channels=PROJECTION_CHANNELS,
-        fpn_out_channels=FPN_OUT_CHANNELS,
-        extra_blocks=LastLevelMaxPool()  # Include P6 for compatibility with default AnchorGenerator
-    )
-    print("Combined backbone created successfully.")
 
-    # --- Create Mask R-CNN Model ---
-    print("Creating MaskRCNN with combined backbone...")
-    try:
-        model = MaskRCNN(
-            combined_backbone,
-            num_classes=NUM_CLASSES,
+# --- Combined Swin + ResNet-Like FPN Backbone ---
+class CombinedSwinResNetLikeFPN(nn.Module):
+    """
+    Combines features from Swin Transformer and a ResNet-like backbone,
+    projects them, and feeds them into an FPN.
+    """
+    def __init__(self,
+                 resnet_like_base: nn.Module,
+                 resnet_like_channels: List[int],
+                 pretrained_swin: bool = True,
+                 projection_channels: int = 256,
+                 fpn_out_channels: int = 256,
+                 extra_blocks: Optional[ExtraFPNBlock] = None):
+        super().__init__()
+
+        # Swin Setup
+        swin_weights = Swin_T_Weights.DEFAULT if pretrained_swin else None
+        swin_base = swin_t(weights=swin_weights).cpu()
+        swin_return_nodes = {
+            'features.1.1.add_1': 'swin_feat0', # Stride 4 -> 96 C
+            'features.3.1.add_1': 'swin_feat1', # Stride 8 -> 192 C
+            'features.5.5.add_1': 'swin_feat2', # Stride 16-> 384 C
+            'features.7.1.add_1': 'swin_feat3', # Stride 32-> 768 C
+        }
+        self.swin_output_keys = list(swin_return_nodes.values())
+        swin_channels = [96, 192, 384, 768]
+        print("Creating Swin feature extractor for combined model...")
+        self.body_swin = create_feature_extractor(swin_base, return_nodes=swin_return_nodes)
+
+        # ResNet-like Setup
+        self.resnet_like_base = resnet_like_base.cpu()
+        resnet_like_return_nodes = {
+            'layer1': 'res_feat0', # Stride 4
+            'layer2': 'res_feat1', # Stride 8
+            'layer3': 'res_feat2', # Stride 16
+            'layer4': 'res_feat3', # Stride 32
+        }
+        self.resnet_like_output_keys = list(resnet_like_return_nodes.values())
+        print("Creating ResNet-like feature extractor for combined model...")
+        self.body_resnet_like = create_feature_extractor(self.resnet_like_base, return_nodes=resnet_like_return_nodes)
+
+        # Projection Layers
+        self.projection_convs = nn.ModuleList()
+        fpn_in_channels_list = []
+        print("Creating projection layers for combined model:")
+        for i in range(len(swin_channels)):
+            concat_channels = swin_channels[i] + resnet_like_channels[i]
+            proj_conv = nn.Conv2d(concat_channels, projection_channels, kernel_size=1)
+            self.projection_convs.append(proj_conv)
+            fpn_in_channels_list.append(projection_channels)
+            print(f"  Stage {i}: Concat Channels={concat_channels} -> Proj Conv -> Out Channels={projection_channels}")
+
+        # FPN
+        print(f"Creating FPN for combined model with input channels: {fpn_in_channels_list}, output channels: {fpn_out_channels}")
+        self.fpn = FeaturePyramidNetwork(
+            in_channels_list=fpn_in_channels_list,
+            out_channels=fpn_out_channels,
+            extra_blocks=extra_blocks,
         )
-        print("MaskRCNN model with combined backbone created successfully.")
-    except Exception as e:
-        import traceback
-        print(f"\nError creating MaskRCNN: {e}")
-        print(traceback.format_exc())
-        exit()
+        self.out_channels = fpn_out_channels # Required by MaskRCNN
 
-    # if weights is not None:
-    #     model.load_state_dict(weights)
+    def forward(self, x):
+        swin_features = self.body_swin(x)
+        resnet_like_features = self.body_resnet_like(x)
+        fpn_input = OrderedDict()
+        for i in range(len(self.swin_output_keys)):
+            swin_key = self.swin_output_keys[i]
+            res_key = self.resnet_like_output_keys[i]
+            fpn_key = str(i)
+            swin_f = swin_features[swin_key]
+            res_f = resnet_like_features[res_key]
+            swin_f_permuted = swin_f.permute(0, 3, 1, 2) # B,H,W,C -> B,C,H,W
+            if swin_f_permuted.shape[2:] != res_f.shape[2:]:
+                # print(f"Warning: Resizing Swin features at stage {i} from {swin_f_permuted.shape[2:]} to {res_f.shape[2:]}")
+                swin_f_permuted = nn.functional.interpolate(swin_f_permuted, size=res_f.shape[2:], mode='bilinear', align_corners=False)
+            combined_f = torch.cat([swin_f_permuted, res_f], dim=1)
+            projected_f = self.projection_convs[i](combined_f)
+            fpn_input[fpn_key] = projected_f
+        fpn_output = self.fpn(fpn_input)
+        return fpn_output
+
+
+# --- Factory Function for ResNet50 Backbone ---
+def maskrcnn_resnet50_fpn(
+    *,
+    num_classes: Optional[int] = None,
+    pretrained: bool = True, # Whether to use pretrained MaskRCNN weights (if available)
+    pretrained_backbone: bool = True, # Whether to use pretrained ResNet weights
+    trainable_backbone_layers: Optional[int] = None, # 0-5, how many ResNet layers to train (higher means more)
+    progress: bool = True,
+    **kwargs: Any,
+) -> MyMaskRCNN:
+    """
+    Constructs a Mask R-CNN model with a ResNet-50-FPN backbone.
+
+    Args:
+        num_classes (Optional[int]): Number of classes (including background). Defaults to 91 (COCO).
+        pretrained (bool): If True, loads weights pretrained on COCO from torchvision (if available for this exact config).
+        pretrained_backbone (bool): If True, loads ImageNet weights for the ResNet backbone.
+        trainable_backbone_layers (Optional[int]): Number of trainable (unfrozen) layers starting from the top.
+                                                  Valid values are 0 to 5. If None, defaults based on `pretrained`.
+        progress (bool): If True, displays a progress bar of the download to stderr.
+    """
+    if pretrained:
+         # Try loading torchvision's pretrained model directly if args match
+         if trainable_backbone_layers is None: trainable_backbone_layers = 3 # Default for pretrained COCO model
+         if num_classes is None: num_classes = DEFAULT_NUM_CLASSES
+
+         if num_classes == DEFAULT_NUM_CLASSES and trainable_backbone_layers == 3:
+             print("Loading pre-trained MaskRCNN ResNet50 FPN from torchvision...")
+             # Note: Using torchvision's direct function if possible
+             weights = MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+             weights_backbone = None # Loaded by the main weights
+             model = torchvision.models.detection.maskrcnn_resnet50_fpn(
+                 weights=weights, progress=progress, num_classes=num_classes,
+                 trainable_backbone_layers=trainable_backbone_layers, **kwargs
+             )
+             # If you need MyMaskRCNN specifically, you might need to rebuild it
+             # and load the state_dict carefully, or just use the torchvision one.
+             # For simplicity here, returning the torchvision model if pretrained matches.
+             # If you *must* use MyMaskRCNN, set pretrained=False and load state_dict later.
+             return model # Return torchvision model directly
+         else:
+             print("Warning: Pretrained weights requested but num_classes or trainable_layers differ from torchvision defaults. Building model from scratch with pretrained backbone.")
+             pretrained = False # Fallback to building from scratch
+
+    # --- Build model from scratch ---
+    weights_backbone = ResNet50_Weights.DEFAULT if pretrained_backbone else None
+    trainable_backbone_layers = _validate_trainable_layers(weights_backbone is not None, trainable_backbone_layers, 5, 3)
+    norm_layer = misc_nn_ops.FrozenBatchNorm2d if weights_backbone is not None else nn.BatchNorm2d
+
+    print(f"Building ResNet50 backbone (trainable layers: {trainable_backbone_layers})...")
+    backbone_model = resnet50(weights=weights_backbone, progress=progress, norm_layer=norm_layer)
+    # Use torchvision's helper to create ResNet+FPN
+    backbone = _resnet_fpn_extractor(backbone_model, trainable_backbone_layers, norm_layer=norm_layer)
+
+    print("Creating MyMaskRCNN with ResNet50 FPN backbone...")
+    model = MyMaskRCNN(backbone, num_classes=num_classes, **kwargs)
 
     return model
 
-if __name__ == "__main__":
-    # Example usage
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # login(token=os.getenv("HUGGINGFACE_TOKEN"))
-    model = my_maskrcnn_swin_t_fpn().to(device)
-    model.eval()
-    # print(model)
-    x = [torch.rand(3, 300, 400).to(device), torch.rand(3, 500, 400).to(device)]
-    predictions = model(x)
-    print(predictions)
+
+# --- Factory Function for Swin-T Backbone ---
+def maskrcnn_swin_t_fpn(
+    *,
+    num_classes: Optional[int] = None,
+    pretrained_backbone: bool = True, # Whether to use pretrained Swin weights
+    fpn_out_channels: int = DEFAULT_FPN_OUT_CHANNELS,
+    progress: bool = True, # Progress for weight download
+    **kwargs: Any,
+) -> MyMaskRCNN:
+    """
+    Constructs a Mask R-CNN model with a Swin Transformer (Swin-T) FPN backbone.
+    """
+    print("Creating Swin-T backbone...")
+    weights_swin = Swin_T_Weights.DEFAULT if pretrained_backbone else None
+    # Load on CPU initially
+    swin_model = swin_t(weights=weights_swin, progress=progress).cpu()
+
+    return_nodes_for_extractor = {
+        'features.1.1.add_1': 'feat0', # Stride 4
+        'features.3.1.add_1': 'feat1', # Stride 8
+        'features.5.5.add_1': 'feat2', # Stride 16
+        'features.7.1.add_1': 'feat3', # Stride 32
+    }
+    extractor_output_keys = list(return_nodes_for_extractor.values())
+    fpn_in_channels_list = [96, 192, 384, 768] # Swin-T specific
+
+    print("Creating Swin feature extractor body...")
+    body = create_feature_extractor(swin_model, return_nodes=return_nodes_for_extractor)
+
+    print("Creating CustomSwinFPN wrapper...")
+    custom_backbone = CustomSwinFPN(
+        body=body,
+        return_layer_keys=extractor_output_keys,
+        fpn_in_channels_list=fpn_in_channels_list,
+        fpn_out_channels=fpn_out_channels,
+        extra_blocks=LastLevelMaxPool() # Add P6 layer
+    )
+
+    print("Creating MyMaskRCNN with Swin-T FPN backbone...")
+    model = MyMaskRCNN(custom_backbone, num_classes=num_classes, **kwargs)
+    return model
+
+
+# --- Factory Function for ResNeXt101 Backbone ---
+def maskrcnn_resnext101_fpn(
+    *,
+    num_classes: Optional[int] = None,
+    pretrained_backbone: bool = True, # Whether to use pretrained ResNeXt weights
+    trainable_backbone_layers: Optional[int] = None, # 0-5
+    progress: bool = True,
+    **kwargs: Any,
+) -> MyMaskRCNN:
+    """
+    Constructs a Mask R-CNN model with a ResNeXt-101-32x8d FPN backbone.
+    """
+    weights_backbone = ResNeXt101_32x8d_Weights.DEFAULT if pretrained_backbone else None
+    trainable_backbone_layers = _validate_trainable_layers(weights_backbone is not None, trainable_backbone_layers, 5, 3)
+    # norm_layer = misc_nn_ops.FrozenBatchNorm2d if weights_backbone is not None else nn.BatchNorm2d
+    # Note: ResNeXt in torchvision might not expose norm_layer in constructor easily, handle freezing manually.
+
+    print(f"Building ResNeXt101 backbone (trainable layers: {trainable_backbone_layers})...")
+    backbone_model = resnext101_32x8d(weights=weights_backbone, progress=progress)
+
+    # Freeze layers manually if FrozenBatchNorm not applicable directly
+    if weights_backbone is not None and trainable_backbone_layers < 5:
+        layers_to_train = ["layer4", "layer3", "layer2", "layer1", "conv1"][:trainable_backbone_layers]
+        if trainable_backbone_layers == 5: layers_to_train.append("bn1") # Should match ResNet freezing logic
+        for name, parameter in backbone_model.named_parameters():
+            if all([not name.startswith(layer) for layer in layers_to_train]):
+                 parameter.requires_grad_(False)
+
+    # FPN setup (similar to ResNet helper)
+    extra_blocks = LastLevelMaxPool()
+    returned_layers = [1, 2, 3, 4]
+    return_layers_dict = {f"layer{k}": str(v) for v, k in enumerate(returned_layers)}
+    in_channels_list = [256, 512, 1024, 2048] # ResNeXt101 specific
+    fpn_out_channels = DEFAULT_FPN_OUT_CHANNELS
+
+    print("Creating ResNeXt101 BackboneWithFPN...")
+    backbone = BackboneWithFPN(
+        backbone_model, return_layers_dict, in_channels_list, fpn_out_channels, extra_blocks=extra_blocks
+    )
+
+    print("Creating MyMaskRCNN with ResNeXt101 FPN backbone...")
+    model = MyMaskRCNN(backbone, num_classes=num_classes, **kwargs)
+    return model
+
+
+# --- Factory Function for Combined Swin + ResNet50 Backbone ---
+def maskrcnn_swin_resnet50_fpn(
+    *,
+    num_classes: Optional[int] = None,
+    pretrained_swin: bool = True,
+    pretrained_resnet: bool = True,
+    projection_channels: int = DEFAULT_FPN_OUT_CHANNELS, # Project concatenated features TO this dim
+    fpn_out_channels: int = DEFAULT_FPN_OUT_CHANNELS,    # Final FPN output channels
+    progress: bool = True,
+    **kwargs: Any,
+) -> MyMaskRCNN:
+    """
+    Constructs Mask R-CNN with a combined Swin-T + ResNet50 FPN backbone.
+    """
+    print("Loading ResNet50 base for combined model...")
+    resnet_weights = ResNet50_Weights.DEFAULT if pretrained_resnet else None
+    resnet_base = resnet50(weights=resnet_weights, progress=progress)
+    resnet_channels = [256, 512, 1024, 2048] # ResNet50 specific
+
+    print("Instantiating CombinedSwinResNetLikeFPN (with ResNet50)...")
+    combined_backbone = CombinedSwinResNetLikeFPN(
+        resnet_like_base=resnet_base,
+        resnet_like_channels=resnet_channels,
+        pretrained_swin=pretrained_swin,
+        projection_channels=projection_channels,
+        fpn_out_channels=fpn_out_channels,
+        extra_blocks=LastLevelMaxPool()
+    )
+
+    print("Creating MyMaskRCNN with combined Swin+ResNet50 backbone...")
+    model = MyMaskRCNN(combined_backbone, num_classes=num_classes, **kwargs)
+    return model
+
+
+# --- Factory Function for Combined Swin + ResNeXt101 Backbone ---
+def maskrcnn_swin_resnext101_fpn(
+    *,
+    num_classes: Optional[int] = None,
+    pretrained_swin: bool = True,
+    pretrained_resnext: bool = True,
+    projection_channels: int = DEFAULT_FPN_OUT_CHANNELS,
+    fpn_out_channels: int = DEFAULT_FPN_OUT_CHANNELS,
+    progress: bool = True,
+    **kwargs: Any,
+) -> MyMaskRCNN:
+    """
+    Constructs Mask R-CNN with a combined Swin-T + ResNeXt-101 FPN backbone.
+    """
+    print("Loading ResNeXt101 base for combined model...")
+    resnext_weights = ResNeXt101_32x8d_Weights.DEFAULT if pretrained_resnext else None
+    resnext_base = resnext101_32x8d(weights=resnext_weights, progress=progress)
+    resnext_channels = [256, 512, 1024, 2048] # ResNeXt101 specific
+
+    print("Instantiating CombinedSwinResNetLikeFPN (with ResNeXt101)...")
+    combined_backbone = CombinedSwinResNetLikeFPN(
+        resnet_like_base=resnext_base,
+        resnet_like_channels=resnext_channels,
+        pretrained_swin=pretrained_swin,
+        projection_channels=projection_channels,
+        fpn_out_channels=fpn_out_channels,
+        extra_blocks=LastLevelMaxPool()
+    )
+
+    print("Creating MyMaskRCNN with combined Swin+ResNeXt101 backbone...")
+    model = MyMaskRCNN(combined_backbone, num_classes=num_classes, **kwargs)
+    return model
+
+
+# --- Example Usage ---
+if __name__ == '__main__':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    dummy_input = torch.randn(1, 3, 512, 512).to(device)
+
+    # Test ResNet50
+    print("\n--- Testing ResNet50 ---")
+    model_resnet50 = maskrcnn_resnet50_fpn(pretrained_backbone=True, num_classes=10)
+    model_resnet50.to(device)
+    model_resnet50.eval()
+    with torch.no_grad():
+        out = model_resnet50(dummy_input)
+    print("ResNet50 OK")
+
+    # Test Swin-T
+    print("\n--- Testing Swin-T ---")
+    model_swin = maskrcnn_swin_t_fpn(pretrained_backbone=True, num_classes=10)
+    model_swin.to(device)
+    model_swin.eval()
+    with torch.no_grad():
+        out = model_swin(dummy_input)
+    print("Swin-T OK")
+
+    # Test ResNeXt101
+    print("\n--- Testing ResNeXt101 ---")
+    model_resnext = maskrcnn_resnext101_fpn(pretrained_backbone=True, num_classes=10)
+    model_resnext.to(device)
+    model_resnext.eval()
+    with torch.no_grad():
+        out = model_resnext(dummy_input)
+    print("ResNeXt101 OK")
+
+    # Test Swin + ResNet50
+    print("\n--- Testing Swin + ResNet50 ---")
+    model_swin_resnet = maskrcnn_swin_resnet50_fpn(pretrained_swin=True, pretrained_resnet=True, num_classes=10)
+    model_swin_resnet.to(device)
+    model_swin_resnet.eval()
+    with torch.no_grad():
+        out = model_swin_resnet(dummy_input)
+    print("Swin + ResNet50 OK")
+
+    # Test Swin + ResNeXt101
+    print("\n--- Testing Swin + ResNeXt101 ---")
+    model_swin_resnext = maskrcnn_swin_resnext101_fpn(pretrained_swin=True, pretrained_resnext=True, num_classes=10)
+    model_swin_resnext.to(device)
+    model_swin_resnext.eval()
+    with torch.no_grad():
+        out = model_swin_resnext(dummy_input)
+    print("Swin + ResNeXt101 OK")

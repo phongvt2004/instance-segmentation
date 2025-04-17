@@ -184,6 +184,12 @@ def get_args_parser(add_help=True):
 
     return parser
 
+custom_models = {
+    "my_maskrcnn_swin_t_fpn": my_maskrcnn_swin_t_fpn,
+    "my_maskrcnn_swin_resnet_fpn": my_maskrcnn_swin_resnet_fpn,
+
+}
+
 
 def main(args):
     if args.backend.lower() == "tv_tensor" and not args.use_v2:
