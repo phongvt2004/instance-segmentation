@@ -330,7 +330,7 @@ class CombinedSwinResNetLikeFPN(nn.Module):
 def maskrcnn_resnet50_fpn(
     *,
     num_classes: Optional[int] = None,
-    pretrained: bool = True, # Whether to use pretrained MaskRCNN weights (if available)
+    pretrained: bool = False, # Whether to use pretrained MaskRCNN weights (if available)
     pretrained_backbone: bool = True, # Kept for consistency, but primarily controlled by `pretrained` logic now
     trainable_backbone_layers: Optional[int] = None, # 0-5, how many ResNet layers to train (higher means more)
     progress: bool = True,
