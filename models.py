@@ -330,46 +330,73 @@ class CombinedSwinResNetLikeFPN(nn.Module):
 def maskrcnn_resnet50_fpn(
     *,
     num_classes: Optional[int] = None,
-    pretrained: bool = True,
-    pretrained_backbone: bool = True,
-    trainable_backbone_layers: Optional[int] = None,
+    pretrained: bool = True, # Whether to use pretrained MaskRCNN weights (if available)
+    pretrained_backbone: bool = True, # Kept for consistency, but primarily controlled by `pretrained` logic now
+    trainable_backbone_layers: Optional[int] = None, # 0-5, how many ResNet layers to train (higher means more)
     progress: bool = True,
     **kwargs: Any,
 ) -> MyMaskRCNN:
-    # ... (Your maskrcnn_resnet50_fpn code - no changes needed here) ...
+    """
+    Constructs a Mask R-CNN model with a ResNet-50-FPN backbone.
+
+    Args:
+        num_classes (Optional[int]): Number of classes (including background). Defaults to 91 (COCO).
+        pretrained (bool): If True, attempts to load weights pretrained on COCO from torchvision.
+        pretrained_backbone (bool): If True (and pretrained=False), loads ImageNet weights for the ResNet backbone.
+        trainable_backbone_layers (Optional[int]): Number of trainable (unfrozen) layers starting from the top.
+                                                  Valid values are 0 to 5. If None, defaults based on `pretrained`.
+        progress (bool): If True, displays a progress bar of the download to stderr.
+    """
+    weights = None # Initialize weights variable for the underlying call
+    weights_backbone = None # Initialize backbone weights variable
+
     if pretrained:
-         if trainable_backbone_layers is None: trainable_backbone_layers = 3 # Default for pretrained COCO model
+         # Set conditions for using the official torchvision pretrained model
+         if trainable_backbone_layers is None: trainable_backbone_layers = 3
          if num_classes is None: num_classes = DEFAULT_NUM_CLASSES
 
          if num_classes == DEFAULT_NUM_CLASSES and trainable_backbone_layers == 3:
              print("Loading pre-trained MaskRCNN ResNet50 FPN from torchvision...")
+             # Get the weights enum
              weights = MaskRCNN_ResNet50_FPN_Weights.DEFAULT
-             # Pass weights enum directly
+             # Filter kwargs to avoid conflict with the 'weights' enum parameter
+             kwargs_filtered = {k: v for k, v in kwargs.items() if k not in ['weights', 'pretrained', 'pretrained_backbone', 'weights_backbone']}
              model = torchvision.models.detection.maskrcnn_resnet50_fpn(
-                 weights=weights, progress=progress,
-                 # num_classes=num_classes, # Let weights handle num_classes
-                 # trainable_backbone_layers=trainable_backbone_layers, # Let weights handle freezing
-                  **kwargs
+                 weights=weights,
+                 progress=progress,
+                 # num_classes and trainable_backbone_layers are implicitly handled by the weights enum
+                 **kwargs_filtered # Pass only non-conflicting kwargs
              )
-             # Check if the returned model is already MyMaskRCNN type, if not, rebuild
-             # For now, assume we might need to rebuild or cast if MyMaskRCNN has overrides
-             # If MyMaskRCNN is just for type hinting or minor overrides, this might be okay
-             # If MyMaskRCNN has significant changes, loading pretrained needs careful state dict mapping
              print("Note: Returning standard torchvision MaskRCNN when using exact pretrained weights.")
-             return model # Return torchvision model directly
+             # Decide if you need to cast to MyMaskRCNN or return directly
+             # If MyMaskRCNN has no critical overrides, returning torchvision's is fine.
+             # If MyMaskRCNN is needed, you'd have to rebuild and load state_dict manually.
+             return model # Return torchvision model directly for simplicity here
          else:
              print("Warning: Pretrained weights requested but num_classes or trainable_layers differ from torchvision defaults. Building model from scratch with pretrained backbone.")
-             pretrained = False # Fallback to building from scratch
+             pretrained_backbone = True # Ensure backbone weights are loaded if pretrained=True failed
+             # Continue to build from scratch below
 
-    weights_backbone = ResNet50_Weights.DEFAULT if pretrained_backbone else None
+    # --- Build model from scratch ---
+    # Determine backbone weights only if not loading full pretrained model above
+    if weights is None: # Ensure we are in the 'build from scratch' path
+        weights_backbone = ResNet50_Weights.DEFAULT if pretrained_backbone else None
+
+    # Validate trainable layers based on whether backbone weights are loaded
     trainable_backbone_layers = _validate_trainable_layers(weights_backbone is not None, trainable_backbone_layers, 5, 3)
     norm_layer = misc_nn_ops.FrozenBatchNorm2d if weights_backbone is not None else nn.BatchNorm2d
 
     print(f"Building ResNet50 backbone (trainable layers: {trainable_backbone_layers})...")
     backbone_model = resnet50(weights=weights_backbone, progress=progress, norm_layer=norm_layer)
+    # Use torchvision's helper to create ResNet+FPN
     backbone = _resnet_fpn_extractor(backbone_model, trainable_backbone_layers, norm_layer=norm_layer)
 
+    # Use the provided num_classes, defaulting if necessary
+    if num_classes is None:
+        num_classes = DEFAULT_NUM_CLASSES
+
     print("Creating MyMaskRCNN with ResNet50 FPN backbone...")
+    # Pass potentially relevant kwargs (excluding those handled by backbone creation)
     model = MyMaskRCNN(backbone, num_classes=num_classes, **kwargs)
 
     return model
