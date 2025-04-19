@@ -179,6 +179,8 @@ def get_args_parser(add_help=True):
         help="Use CopyPaste data augmentation. Works only with data-augmentation='lsj'.",
     )
 
+    parser.add_argument("--projection-channels", default=256, type=int, help="Projection channels for CombinedBackbone")
+
     parser.add_argument("--backend", default="PIL", type=str.lower, help="PIL or tensor - case insensitive")
     parser.add_argument("--use-v2", action="store_true", help="Use V2 transforms")
 
@@ -257,7 +259,7 @@ def main(args):
         if args.rpn_score_thresh is not None:
             kwargs["rpn_score_thresh"] = args.rpn_score_thresh
     model = custom_models[args.model](
-        weights=args.weights, weights_backbone=args.weights_backbone, num_classes=num_classes, **kwargs
+        projection_channels=args.projection_channels, weights_backbone=args.weights_backbone, num_classes=num_classes, **kwargs
     )
     model.to(device)
     if args.distributed and args.sync_bn:
