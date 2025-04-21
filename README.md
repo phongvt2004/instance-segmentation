@@ -13,7 +13,7 @@ matplotlib
 ```
 
 You must modify the following flags:
-
+`--model=maskrcnn_resnet50_fpn/maskrcnn_resnext101_fpn/maskrcnn_swin_t_fpn/maskrcnn_swin_resnet50_fpn/maskrcnn_swin_resnext101_fpn`
 `--data-path=/path/to/coco/dataset`
 
 `--nproc_per_node=<number_of_gpus_available>`
@@ -22,7 +22,7 @@ You must modify the following flags:
 | Link            |
 | ------------------ |
 | [Our COCO subset](https://www.kaggle.com/datasets/phongvt2k4/coco-2017-subset) |
-| [Checkpoints](https://www.kaggle.com/models/phongvt2k4/checkpoint-mask-rcnn) |
+| [Checkpoints](https://www.kaggle.com/models/phongvt2k4/checkpoints-maskrcnn) |
 
 ### Training
 ```
